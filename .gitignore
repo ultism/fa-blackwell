@@ -20,3 +20,22 @@ env/
 .idea/
 *.swp
 .DS_Store
+
+# Build artifacts: compiled CUDA executables are built in-place next to their .cu
+# sources in bench/ and tests/. Ignore everything in those dirs, then re-include
+# only the source files (and let git recurse into subdirs like csrc/, cutlass_ex/).
+*.log
+/bench/**
+/tests/**
+!/bench/**/
+!/tests/**/
+!/bench/**/*.cu
+!/bench/**/*.cuh
+!/bench/**/*.py
+!/bench/**/*.sh
+!/bench/**/*.md
+!/tests/**/*.cu
+!/tests/**/*.cuh
+!/tests/**/*.py
+!/tests/**/*.sh
+!/tests/**/*.md
