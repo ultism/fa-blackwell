@@ -5,6 +5,38 @@ first. Each entry: what bit us, the measured evidence, and the actionable rule.
 
 ---
 
+## S5: filling one MMA operand from another's accumulator by `__shfl` — work in `recast<uint32>` words and prove the source-word index is warp-uniform
+
+**TL;DR:** To hand P from the QK accumulator (PV is back-to-back with QK) straight into
+the PV-A register operand without an smem transpose, you shuffle e4m3 bytes across the
+quad. The instinct is a per-element gather (each dest e4m3 ← some lane's e4m3), but
+`__shfl_sync` moves 32-bit words and **can't index a remote lane's register array by a
+runtime index** — the source lane doesn't know which of its values you want. The clean
+formulation: pack each thread's quantized bytes into `uint32 qw[...]`, and for each
+**destination** `recast<uint32>(tOrP)` word, issue ONE `__shfl_sync(mask, qw[g], srcLane)`
+per source lane with a **per-lane `srcLane`** but a **compile-time-uniform word index `g`**.
+
+**Why uniformity matters:** `__shfl_sync` reads the *same named variable* from the source
+lane, so `g` must be identical across all lanes that co-issue the instruction, while
+`srcLane` may differ per lane. For our mxfp8 m16n8k32 maps (QK-C key→lane `(key/2)%4`,
+PV-A key→lane `(key/4)%4`), the dest word for `(q-row r, e2, mk)` needs source word
+`g = e2 + 2*mk`, and `g` is warp-uniform precisely because the dest key base `Kd = 4*L +
+16*e2 + 32*mk` has `4*L < 16`, so the lane term drops out of `g = Kd/16`. That single
+fact is what makes the whole thing one `__shfl` per word instead of a scatter. The two
+source lanes are `{qb + 2*(L&1), qb + 2*(L&1) + 1}` (`qb = lane & ~3`, `L = lane%4`), and
+`half = (L>>1)&1` selects the low-16b (L∈{0,1}) vs high-16b (L∈{2,3}) of each fetched word.
+
+**Rule:** when redistributing an MMA operand across lanes, (1) cast both sides to the
+byte-packed `uint32` view and reason per-word, not per-element; (2) derive the source-word
+index symbolically and **verify it's uniform across the warp** before writing the `__shfl`
+— if it isn't, restructure the packing until it is; (3) get the constants from a layout
+probe (`partition_C` vs `partition_A`/`partition_B` over an identity tensor), never by hand.
+Validate bit-exact against the smem-transpose path kept behind a macro, and on RANDOM data
+(constant data is layout-blind — see the V-SF entry). Measured payoff: −11.7%/−11.8%
+cycles (ncu base-clock) from deleting 2 NamedBarriers + a 16KB smem round-trip per n_block.
+
+---
+
 ## Measuring O error: normalize by max|O|, never per-element `clamp_min` (it explodes on near-zero O)
 
 **TL;DR:** Attention output O has entries that are legitimately ~0 (rows where the

@@ -59,6 +59,15 @@ constexpr int kSFPadHD = (kHeadDim < 128 ? 128 : kHeadDim);
 constexpr bool kPDynamicScale = (S3_P_DYNAMIC_SCALE != 0);
 constexpr bool kPConstSF      = (S3_P_CONST_SF != 0);
 constexpr int  kPScaleExp     = -8;            // fixed: scale = 2^-se = 256.0
+// S5: fill the PV-A operand (tOrP) directly from the QK accumulator via an intra-quad
+// __shfl, dropping the S2 smem-transpose round-trip (2 NamedBarriers + sP write + ldmatrix
+// read, per n_block). Valid only with a fixed P scale (kPConstSF): the SF is then a
+// compile-time constant so ONLY the e4m3 data shuffles (no SF shuffle, unlike SageAttention's
+// dynamic-nvfp4 path). Set S3_P_SMEM=1 to fall back to the smem oracle path (the bit-exact
+// reference, and the only path the dynamic-scale A/B can use since a dynamic SF must transit smem).
+#ifndef S3_P_SMEM
+#define S3_P_SMEM 0
+#endif
 constexpr int NBLK = kHeadDim / SFVecSize;        // SF blocks along head_dim (QK contraction)
 constexpr int NKB  = kBlockN / SFVecSize;         // SF blocks along keys (PV contraction) = 4
 constexpr int kNWarps = 12, kNThreads = kNWarps * 32;     // 384
@@ -438,7 +447,11 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             if ((lane % 4) == 0) params.out_Mnb[q * n_block_total + nb] = row_max[mi];
           } }
 
-        // ---- quantize P (e4m3 + ue8m0 per 32-key block) -> smem transpose buffer ----
+        // ---- quantize P (e4m3) and deliver it to the PV-A operand tOrP ----
+#if S3_P_SMEM
+        // S2 oracle path: quantize to a register fragment, scatter to a swizzled smem
+        // transpose buffer by logical (q,key), ldmatrix back as PV-A. Two NamedBarriers
+        // bracket the shared sP buffer. Also the only path valid for a dynamic per-block SF.
         cutlass::arch::NamedBarrier(NumMmaThreads, kQuantBarrier).sync();   // prev nb's PV readers done
         Tensor rP = make_fragment_like<Element>(accS);
         Tensor rP_rc = make_tensor(rP.data(), accS_rc.layout());
@@ -474,8 +487,6 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         }
         copy(rP, thr_qk.partition_C(as_position_independent_swizzle_tensor(sP)));
         cutlass::arch::NamedBarrier(NumMmaThreads, kQuantBarrier).sync();   // P/SF visible
-
-        // ---- load PV operands ----
         copy(scP, tscP.partition_S(as_position_independent_swizzle_tensor(sP)), tscP.retile_D(tOrP));
         if constexpr (kPConstSF) {   // constant P scale -> no smem SF, no gather
           CUTLASS_PRAGMA_UNROLL
@@ -487,6 +498,62 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             tOrSFP(i) = ss.sSFP[int(get<0>(c)) * NKB + int(get<1>(c)) / SFVecSize];
           }
         }
+#else
+        // S5 path: quantize accS to e4m3 in registers, then intra-quad __shfl directly into
+        // the PV-A operand tOrP -- no sP, no NamedBarrier. The QK-C key partition (2 adjacent
+        // keys/lane, comb stride 8) differs from PV-A's (4 contiguous keys/lane), but the
+        // redistribution is entirely within a 4-lane quad, so a shuffle (not smem) suffices.
+        static_assert(kPConstSF, "S5 shuffle path needs a fixed P scale (const SF); build -DS3_P_SMEM=1 for the dynamic-scale oracle");
+        // Pack this thread's 32 quantized P bytes per q-row into 8 little-endian uint32 words:
+        // word g (ni=4g..4g+3) holds keys {16g+2ql, +1, +8, +9} for this lane's ql=lane%4.
+        uint32_t qw[kNRow][8];
+        CUTLASS_PRAGMA_UNROLL
+        for (int r = 0; r < kNRow; ++r) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int g = 0; g < 8; ++g) {
+            uint32_t w = 0;
+            CUTLASS_PRAGMA_UNROLL
+            for (int b = 0; b < 4; ++b)
+              w |= uint32_t(quant_e4m3(accS_rc(r, 4 * g + b), kPScaleExp).storage) << (8 * b);
+            qw[r][g] = w;
+          }
+        }
+        if (params.out_dbg) {       // dequantized requant-P, indexed by logical (q, key)
+          CUTLASS_PRAGMA_UNROLL
+          for (int r = 0; r < kNRow; ++r) {
+            int q = m_block * kBlockM + warp * 16 + (lane / 4) + r * 8;
+            CUTLASS_PRAGMA_UNROLL
+            for (int ni = 0; ni < kNCol; ++ni) {
+              int col = (ni / 2) * 8 + (lane % 4) * 2 + (ni % 2);
+              params.out_dbg[q * params.seqlen_k + nb * kBlockN + col] =
+                  float(quant_e4m3(accS_rc(r, ni), kPScaleExp)) * exp2f(float(kPScaleExp));
+            }
+          }
+        }
+        // Gather: PV-A lane L's uint32 (q-row r, e2, mk) takes the low/high 16b of source
+        // word g=e2+2mk from quad lanes {2(L&1), 2(L&1)+1}; half=(L>>1)&1 picks low vs high.
+        {
+          Tensor tOrP_u32 = recast<uint32_t>(tOrP);   // ((1,2,2),1,MMA_K)
+          int const qb = lane & ~3, off = 2 * (lane & 1), half = (lane >> 1) & 1;
+          CUTLASS_PRAGMA_UNROLL
+          for (int mk = 0; mk < size<2>(tOrP_u32); ++mk) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int e2 = 0; e2 < 2; ++e2) {
+              int const g = e2 + 2 * mk;
+              CUTLASS_PRAGMA_UNROLL
+              for (int r = 0; r < kNRow; ++r) {
+                uint32_t wlo = __shfl_sync(0xffffffffu, qw[r][g], qb + off);
+                uint32_t whi = __shfl_sync(0xffffffffu, qw[r][g], qb + off + 1);
+                uint32_t lo = half ? (wlo >> 16) : (wlo & 0xffffu);
+                uint32_t hi = half ? (whi >> 16) : (whi & 0xffffu);
+                tOrP_u32(make_coord(_0{}, r, e2), _0{}, mk) = lo | (hi << 16);
+              }
+            }
+          }
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(tOrSFP); ++i) tOrSFP(i) = ElementSF::bitcast(uint8_t(kPScaleExp + 127));
+#endif
         { auto t = pipeline_v.consumer_try_wait(rv); pipeline_v.consumer_wait(rv, t);
           copy(scV, tscV.partition_S(as_position_independent_swizzle_tensor(sV)), tscV.retile_D(tOrV));
           copy(scSFV, tscSFV.partition_S(as_position_independent_swizzle_tensor(sSFV)), tscSFV.retile_D(tOrSFV)); }
