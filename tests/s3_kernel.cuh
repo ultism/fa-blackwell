@@ -156,6 +156,7 @@ struct Params {
   LayoutSF layout_sfq;          // seqlen_q x 128 (Q spans all m_blocks)
   LayoutSFV layout_sfv;         // head_dim x seqlen_k (V spans all n_blocks, scale along keys)
   int seqlen_q, seqlen_k, n_block_total;
+  int const* tile_kv_len;   // OPTIONAL [num_q_tiles]: per-q-tile key count (variable-cost / varlen proxy); nullptr -> seqlen_k
   float sm_scale;
   float* out_O;     // [seqlen_q, head_dim]
   float* out_lse;   // [seqlen_q]
@@ -265,9 +266,10 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
       for (auto work = scheduler.get_initial_work(sched_params); work.is_valid(sched_params);
            work = scheduler.get_next_work(sched_params, work)) {
         int const m_block = get<0>(work.get_block_coord(sched_params));
+        int const nb_tile = params.tile_kv_len ? (params.tile_kv_len[m_block] + kBlockN - 1) / kBlockN : n_block_total;
         int const n_block_max = Causal
-            ? cute::min(n_block_total, ((m_block + 1) * kBlockM + kBlockN - 1) / kBlockN)
-            : n_block_total;
+            ? cute::min(nb_tile, ((m_block + 1) * kBlockM + kBlockN - 1) / kBlockN)
+            : nb_tile;
 
         Tensor gQ   = local_tile(mQ,   select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
         Tensor gSFQ = local_tile(mSFQ, select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
@@ -343,9 +345,10 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
     for (auto work = scheduler.get_initial_work(sched_params); work.is_valid(sched_params);
          work = scheduler.get_next_work(sched_params, work)) {
       int const m_block = get<0>(work.get_block_coord(sched_params));
+      int const nb_tile = params.tile_kv_len ? (params.tile_kv_len[m_block] + kBlockN - 1) / kBlockN : n_block_total;
       int const n_block_max = Causal
-          ? cute::min(n_block_total, ((m_block + 1) * kBlockM + kBlockN - 1) / kBlockN)
-          : n_block_total;
+          ? cute::min(nb_tile, ((m_block + 1) * kBlockM + kBlockN - 1) / kBlockN)
+          : nb_tile;
 
       // online-softmax row state (this thread owns 2 rows).
       float row_max[2] = {-INFINITY, -INFINITY};

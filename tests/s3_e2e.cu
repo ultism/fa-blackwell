@@ -48,7 +48,8 @@ static int query_num_sm() {
 template <typename Scheduler, bool Causal>
 static int run_case(const char* tag, Params params, typename Scheduler::Arguments sched_args,
                     int SQ, int SK, int HD, int n_block_total, float sm_scale,
-                    const std::vector<uint8_t>& hV, const std::vector<int>& vexp) {
+                    const std::vector<uint8_t>& hV, const std::vector<int>& vexp,
+                    const std::vector<int>& tile_kv_len = {}) {
   typename Scheduler::Params sp = Scheduler::to_underlying_arguments(sched_args);
   dim3 grid = Scheduler::get_grid_dim(sched_args, query_num_sm());
   int smem_bytes = int(sizeof(SharedStorage));
@@ -72,7 +73,8 @@ static int run_case(const char* tag, Params params, typename Scheduler::Argument
   std::vector<double> Oref(SQ * HD, 0.0), Lref(SQ, 0.0), LSEref(SQ, 0.0);
   for (int m = 0; m < SQ; ++m) {
     int m_block = m / kBlockM;
-    int n_block_max = Causal ? std::min(n_block_total, ((m_block + 1) * kBlockM + kBlockN - 1) / kBlockN) : n_block_total;
+    int nb_tile = tile_kv_len.empty() ? n_block_total : (tile_kv_len[m_block] + kBlockN - 1) / kBlockN;
+    int n_block_max = Causal ? std::min(nb_tile, ((m_block + 1) * kBlockM + kBlockN - 1) / kBlockN) : nb_tile;
     double Mlast = hMnb[m * n_block_total + (n_block_max - 1)];
     double l = 0.0;
     std::vector<double> O(HD, 0.0);
@@ -192,15 +194,32 @@ int main() {
   params.layout_sf = layoutSF; params.layout_sfq = layoutSFQ; params.layout_sfv = layoutSFV;
   params.seqlen_q = SQ; params.seqlen_k = SK; params.n_block_total = n_block_total; params.sm_scale = sm_scale;
   params.out_O = dO; params.out_lse = dLSE; params.out_l = dL; params.out_Ppre = dPpre; params.out_Mnb = dMnb; params.out_dbg = nullptr;
+  params.tile_kv_len = nullptr;
 
   using Scheduler = flashinfer::S3_SCHEDULER;
   Scheduler::Arguments sa{m_block_max, 1, SQ, SK, cutlass::FastDivmod(1)};
   dim3 grid = Scheduler::get_grid_dim(sa, query_num_sm());
   printf("  grid=(%u,%u,%u) smem=%d threads=%d\n", grid.x, grid.y, grid.z, int(sizeof(SharedStorage)), kNThreads);
 
+  // Optional variable per-tile kv_len (varlen-cost proxy for the scheduler, S4b-1).
+  // S3_VARKV=1 -> each q-tile attends a different #key-blocks (multiples of kBlockN);
+  // exercises the per-tile n_block_max path the LPT scheduler will balance.
+  std::vector<int> tile_kv;
+  int* d_tile_kv = nullptr;
+  if (std::getenv("S3_VARKV")) {
+    tile_kv.resize(m_block_max);
+    for (int t = 0; t < m_block_max; ++t) tile_kv[t] = std::min(SK, ((t % n_block_total) + 1) * kBlockN);
+    CK(cudaMalloc(&d_tile_kv, sizeof(int) * m_block_max));
+    CK(cudaMemcpy(d_tile_kv, tile_kv.data(), sizeof(int) * m_block_max, cudaMemcpyHostToDevice));
+    params.tile_kv_len = d_tile_kv;
+    printf("  VARKV per-tile n_blocks:");
+    for (int t = 0; t < m_block_max; ++t) printf(" %d", tile_kv[t] / kBlockN);
+    printf("\n");
+  }
+
   int rc = 0;
-  rc |= run_case<Scheduler, false>("non-causal", params, sa, SQ, SK, HD, n_block_total, sm_scale, hV, vexp);
-  rc |= run_case<Scheduler, true >("causal    ", params, sa, SQ, SK, HD, n_block_total, sm_scale, hV, vexp);
+  rc |= run_case<Scheduler, false>("non-causal", params, sa, SQ, SK, HD, n_block_total, sm_scale, hV, vexp, tile_kv);
+  rc |= run_case<Scheduler, true >("causal    ", params, sa, SQ, SK, HD, n_block_total, sm_scale, hV, vexp, tile_kv);
   printf(rc == 0 ? "S3 PASS\n" : "S3 FAIL\n");
   return rc;
 }

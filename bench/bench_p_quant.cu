@@ -98,6 +98,7 @@ int main(int argc, char** argv) {
   params.seqlen_q = SQ; params.seqlen_k = SK; params.n_block_total = n_block_total; params.sm_scale = sm_scale;
   params.out_O = dO; params.out_lse = dLSE; params.out_l = dL;
   params.out_Ppre = nullptr; params.out_Mnb = nullptr; params.out_dbg = nullptr;   // timing: no dumps
+  params.tile_kv_len = nullptr;
 
   Scheduler::Arguments sa{m_block_max, 1, SQ, SK, cutlass::FastDivmod(1)};
   float mn, mean, sd; int regs, occ;

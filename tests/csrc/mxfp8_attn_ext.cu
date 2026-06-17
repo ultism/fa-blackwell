@@ -100,6 +100,7 @@ std::vector<torch::Tensor> mxfp8_attn(
   params.seqlen_q = SQ; params.seqlen_k = SK; params.n_block_total = n_block_total; params.sm_scale = float(sm_scale);
   params.out_O = O.data_ptr<float>(); params.out_lse = LSE.data_ptr<float>();
   params.out_l = dL; params.out_Ppre = Ppre.data_ptr<float>(); params.out_Mnb = dMnb; params.out_dbg = Pdbg.data_ptr<float>();
+  params.tile_kv_len = nullptr;
 
   Scheduler::Arguments sa{m_block_max, 1, SQ, SK, cutlass::FastDivmod(1)};
   Scheduler::Params sp = Scheduler::to_underlying_arguments(sa);
