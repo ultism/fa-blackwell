@@ -124,23 +124,31 @@ using SmemLayoutSFV = SmemLayoutAtomSFK;     // V depth-1
 using SmemCopyAtomData = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
 using SmemCopyAtomSF   = Copy_Atom<UniversalCopy<ElementSF>, ElementSF>;
 
-using LayoutSF = decltype(BlkSF::tile_atom_to_shape_SFA(make_shape(int(kBlockM), int(kBlockN), int(kSFPadHD))));
+// S6a-2 (GQA): SF gmem layouts carry a trailing head (L) mode -- tile_atom_to_shape_SF*
+// takes a 4D problem (M,N,K,L) -> rank-3 SF layout (M,K,L) / (N,K,L). L=1 (single head)
+// is byte-identical to the old rank-2 form (the L slab is a single tile), so dense stays
+// bit-exact; multi-head selects L=head before local_tile.
+using LayoutSF = decltype(BlkSF::tile_atom_to_shape_SFA(make_shape(int(kBlockM), int(kBlockN), int(kSFPadHD), int(1))));
 // V is the PV B operand [head_dim, keys], block-scaled along KEYS -> SFB layout (head_dim, keys),
 // NOT K's SFA (keys, head_dim). Per-block type for the TMA descriptor; the full
 // (head_dim x seqlen_k) runtime layout has the SAME C++ type (all extents dynamic int).
-using LayoutSFV = decltype(BlkSF::tile_atom_to_shape_SFB(make_shape(int(kBlockM), int(kHeadDim), int(kBlockN))));
+using LayoutSFV = decltype(BlkSF::tile_atom_to_shape_SFB(make_shape(int(kBlockM), int(kHeadDim), int(kBlockN), int(1))));
 
+// S6a-2 (GQA): the data TMA tensors gain a trailing head mode (token-major production
+// layout [token, head, head_dim]: head_dim is stride-1 (inside the box), head is a
+// non-tiled batch coordinate sliced before local_tile). Stride VALUES are irrelevant to
+// the descriptor TYPE (all dynamic int), only rank/staticness must match the host build.
 using TMA_Q = decltype(make_tma_copy(
     SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)),
-        make_shape(int(kBlockM), int(kHeadDim)), make_stride(int(kHeadDim), _1{})),
+        make_shape(int(kBlockM), int(kHeadDim), int(1)), make_stride(int(kHeadDim), _1{}, int(kHeadDim))),
     SmemLayoutQ{}, select<0, 2>(TileShape_MNK{}), _1{}));
 using TMA_K = decltype(make_tma_copy(
     SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)),
-        make_shape(int(8 * kBlockN), int(kHeadDim)), make_stride(int(kHeadDim), _1{})),
+        make_shape(int(8 * kBlockN), int(kHeadDim), int(1)), make_stride(int(kHeadDim), _1{}, int(kHeadDim))),
     SmemLayoutK{}(_, _, _0{}), select<1, 2>(TileShape_MNK{}), _1{}));
 using TMA_V = decltype(make_tma_copy(
     SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)),
-        make_shape(int(kHeadDim), int(8 * kBlockN)), make_stride(int(8 * kBlockN), _1{})),
+        make_shape(int(kHeadDim), int(8 * kBlockN), int(1)), make_stride(int(8 * kBlockN), _1{}, int(kHeadDim * 8 * kBlockN))),
     SmemLayoutVt{}, make_shape(Int<kHeadDim>{}, Int<kBlockN>{}), _1{}));
 using TMA_SFQ = decltype(make_tma_copy<uint16_t>(
     SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr(static_cast<ElementSF const*>(nullptr)), LayoutSF{}),
@@ -164,11 +172,12 @@ struct Params {
   LayoutSF layout_sfq;          // seqlen_q x 128 (Q spans all m_blocks)
   LayoutSFV layout_sfv;         // head_dim x seqlen_k (V spans all n_blocks, scale along keys)
   int seqlen_q, seqlen_k, n_block_total;
+  int num_qo_heads, num_kv_heads;   // GQA: Q indexes qo_head, K/V index kv_head=qo_head/group_size (1,1 = single-head dense)
   int const* tile_kv_len;   // OPTIONAL [num_q_tiles]: per-q-tile key count (variable-cost / varlen proxy); nullptr -> seqlen_k
   float sm_scale;
-  float* out_O;     // [seqlen_q, head_dim]
-  float* out_lse;   // [seqlen_q]
-  float* out_l;     // [seqlen_q] row_sum (cross-check)
+  float* out_O;     // token-major [seqlen_q, head_dim, num_qo_heads]: O(q,hd,h) at q*num_qo_heads*head_dim + h*head_dim + hd
+  float* out_lse;   // head-major [num_qo_heads, seqlen_q]: lse(h,q) at h*seqlen_q + q
+  float* out_l;     // head-major [num_qo_heads, seqlen_q] row_sum (cross-check)
   float* out_Ppre;  // [seqlen_q, seqlen_k] device pre-quant fp32 P (host re-quantizes the SAME P)
   float* out_Mnb;   // [seqlen_q, n_block_total] running max after each block (-inf if skipped)
   float* out_dbg;   // [seqlen_q, seqlen_k] OPTIONAL (nullptr to skip): device dequantized requant-P
@@ -258,18 +267,18 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
     // -------- producer --------
     cutlass::arch::warpgroup_reg_dealloc<24>();
     if (warp_in_wg == 0 && elect) {
-      Tensor mQ   = params.tma_q.get_tma_tensor(make_shape(int(params.seqlen_q), int(kHeadDim)));
-      Tensor mK   = params.tma_k.get_tma_tensor(make_shape(int(params.seqlen_k), int(kHeadDim)));
-      Tensor mV   = params.tma_v.get_tma_tensor(make_shape(int(kHeadDim), int(params.seqlen_k)));
-      Tensor mSFQ = params.tma_sfq.get_tma_tensor(shape(params.layout_sfq));
-      // Full SFK nominal shape, built in-kernel from seqlen_k (tile_atom_to_shape_SFA is
-      // CUTE_HOST_DEVICE). Matches FlashInfer's get_tma_tensor(shape(layout_SFK)) so the
-      // n-block index stays WITHIN the nominal shape -- no reliance on out-of-nominal
-      // arithmetic tile coordinates. The descriptor (host, over the full/packed SFK) is
-      // unchanged, so addressing is byte-identical to the old per-block-nominal form.
-      Tensor mSFK = params.tma_sfk.get_tma_tensor(
-          shape(BlkSF::tile_atom_to_shape_SFA(make_shape(int(params.seqlen_k), int(kBlockN), int(kHeadDim)))));
-      Tensor mSFV = params.tma_sfv.get_tma_tensor(shape(params.layout_sfv));
+      // 3D coordinate tensors (..., head): the trailing head mode is sliced per work-item
+      // below (Q/SFQ by qo_head, K/V/SFK/SFV by kv_head). SFK's full nominal shape is built
+      // in-kernel from seqlen_k+num_kv_heads (tile_atom_to_shape_SFA is CUTE_HOST_DEVICE) so
+      // the n-block index stays WITHIN nominal -- matches FlashInfer, no out-of-nominal
+      // arithmetic. Descriptors (host, over the full/packed tensors) are unchanged.
+      Tensor mQ3d   = params.tma_q.get_tma_tensor(make_shape(int(params.seqlen_q), int(kHeadDim), int(params.num_qo_heads)));
+      Tensor mK3d   = params.tma_k.get_tma_tensor(make_shape(int(params.seqlen_k), int(kHeadDim), int(params.num_kv_heads)));
+      Tensor mV3d   = params.tma_v.get_tma_tensor(make_shape(int(kHeadDim), int(params.seqlen_k), int(params.num_kv_heads)));
+      Tensor mSFQ3d = params.tma_sfq.get_tma_tensor(shape(params.layout_sfq));
+      Tensor mSFK3d = params.tma_sfk.get_tma_tensor(
+          shape(BlkSF::tile_atom_to_shape_SFA(make_shape(int(params.seqlen_k), int(kBlockN), int(kHeadDim), int(params.num_kv_heads)))));
+      Tensor mSFV3d = params.tma_sfv.get_tma_tensor(shape(params.layout_sfv));
       auto bq = params.tma_q.get_slice(_0{}); auto bsq = params.tma_sfq.get_slice(_0{});
       auto bk = params.tma_k.get_slice(_0{}); auto bsk = params.tma_sfk.get_slice(_0{});
       auto bv = params.tma_v.get_slice(_0{}); auto bsv = params.tma_sfv.get_slice(_0{});
@@ -285,6 +294,7 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         // multiples of the tile (one request-tile-base offset addresses data AND blocked SF).
         auto const bc = work.get_block_coord(sched_params);
         int const q_tile_local = get<0>(bc);
+        int const qo_head_idx = get<1>(bc), kv_head_idx = get<2>(bc);
         int const qo_indptr = get<3>(bc), kv_indptr = get<4>(bc), kv_len = get<6>(bc);
         int const q_tile_global = qo_indptr / kBlockM + q_tile_local;
         int const kv_tile_base  = kv_indptr / kBlockN;
@@ -293,6 +303,15 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         int const n_block_max = Causal
             ? cute::min(nb_tile, ((q_tile_local + 1) * kBlockM + kBlockN - 1) / kBlockN)
             : nb_tile;
+
+        // GQA: slice the head mode (Q/SFQ by qo_head, K/V/SFK/SFV by kv_head). Single-head
+        // dense passes qo_head=kv_head=0 (the only slice) -> identical addressing.
+        Tensor mQ   = mQ3d(_, _, qo_head_idx);
+        Tensor mSFQ = mSFQ3d(_, _, qo_head_idx);
+        Tensor mK   = mK3d(_, _, kv_head_idx);
+        Tensor mSFK = mSFK3d(_, _, kv_head_idx);
+        Tensor mV   = mV3d(_, _, kv_head_idx);
+        Tensor mSFV = mSFV3d(_, _, kv_head_idx);
 
         Tensor gQ   = local_tile(mQ,   select<0, 2>(TileShape_MNK{}), make_coord(q_tile_global, _0{}));
         Tensor gSFQ = local_tile(mSFQ, select<0, 2>(TileShape_MNK{}), make_coord(q_tile_global, _0{}));
@@ -358,9 +377,10 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
     auto max_op = [](float a, float b) { return fmaxf(a, b); };
     auto add_op = [](float a, float b) { return a + b; };
 
-    Tensor mO = make_tensor(make_gmem_ptr(params.out_O),
-                            make_layout(make_shape(int(params.seqlen_q), int(kHeadDim)),
-                                        make_stride(int(kHeadDim), _1{})));
+    // token-major [seqlen_q, head_dim, num_qo_heads]; sliced by qo_head per work-item below.
+    Tensor mO3d = make_tensor(make_gmem_ptr(params.out_O),
+                              make_layout(make_shape(int(params.seqlen_q), int(kHeadDim), int(params.num_qo_heads)),
+                                          make_stride(int(params.num_qo_heads * kHeadDim), _1{}, int(kHeadDim))));
     Tensor mPpre = make_tensor(make_gmem_ptr(params.out_Ppre),
                                make_layout(make_shape(int(params.seqlen_q), int(params.seqlen_k)),
                                            make_stride(int(params.seqlen_k), _1{})));
@@ -370,9 +390,11 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
          work = scheduler.get_next_work(sched_params, work)) {
       auto const bc = work.get_block_coord(sched_params);
       int const q_tile_local = get<0>(bc);
+      int const qo_head_idx = get<1>(bc);
       int const qo_indptr = get<3>(bc), kv_indptr = get<4>(bc), qo_len = get<5>(bc), kv_len = get<6>(bc);
       int const q_tile_global = qo_indptr / kBlockM + q_tile_local;
       int const kv_tile_base  = kv_indptr / kBlockN;
+      Tensor mO = mO3d(_, _, qo_head_idx);   // GQA: this work-item's output head
       int const nb_tile = params.tile_kv_len ? (params.tile_kv_len[q_tile_local] + kBlockN - 1) / kBlockN
                                              : (kv_len + kBlockN - 1) / kBlockN;
       int const n_block_max = Causal
@@ -623,8 +645,9 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         int q_local = q_tile_local * kBlockM + warp * 16 + (lane / 4) + mi * 8;
         int q = q_tile_global * kBlockM + warp * 16 + (lane / 4) + mi * 8;
         if (q_local < qo_len && (lane % 4) == 0) {
-          params.out_l[q] = row_sum[mi];
-          params.out_lse[q] = (row_sum[mi] == 0.f) ? -INFINITY : (row_max[mi] * sm_scale + logf(row_sum[mi]));
+          int qh = qo_head_idx * params.seqlen_q + q;   // head-major lse/l
+          params.out_l[qh] = row_sum[mi];
+          params.out_lse[qh] = (row_sum[mi] == 0.f) ? -INFINITY : (row_max[mi] * sm_scale + logf(row_sum[mi]));
         }
       }
     }

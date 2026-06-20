@@ -73,9 +73,9 @@ int main(int argc, char** argv) {
   // device buffers (constant e4m3 data + flat SF=127; timing is data-independent)
   std::vector<uint8_t> hQ(SQ * HD, e4m3_byte(1.f)), hK(SK * HD, e4m3_byte(1.f)), hV(HD * SK, e4m3_byte(1.f));
   auto layoutSF  = BlkSF::tile_atom_to_shape_SFA(make_shape(int(kBlockM), int(kBlockN), int(kHeadDim)));
-  auto layoutSFQ = BlkSF::tile_atom_to_shape_SFA(make_shape(SQ, int(kBlockN), int(kHeadDim)));
-  auto layoutSFK = BlkSF::tile_atom_to_shape_SFA(make_shape(SK, int(kBlockN), int(kHeadDim)));
-  auto layoutSFV = BlkSF::tile_atom_to_shape_SFB(make_shape(int(kBlockM), int(kHeadDim), SK));
+  auto layoutSFQ = BlkSF::tile_atom_to_shape_SFA(make_shape(SQ, int(kBlockN), int(kHeadDim), 1));
+  auto layoutSFK = BlkSF::tile_atom_to_shape_SFA(make_shape(SK, int(kBlockN), int(kHeadDim), 1));
+  auto layoutSFV = BlkSF::tile_atom_to_shape_SFB(make_shape(int(kBlockM), int(kHeadDim), SK, 1));
   std::vector<uint8_t> hSFQ(cosize(layoutSFQ), 127), hSFK(cosize(layoutSFK), 127), hSFV(cosize(layoutSFV), 127);
 
   Element *dQ, *dK, *dV; ElementSF *dSFQ, *dSFK, *dSFV; float *dO, *dLSE, *dL; int* dKV;
@@ -93,9 +93,9 @@ int main(int argc, char** argv) {
   CK(cudaMemcpy(dKV, kv_len.data(), n_tiles * sizeof(int), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(dOrder, order.data(), n_tiles * sizeof(int), cudaMemcpyHostToDevice));
 
-  Tensor mQ = make_tensor(make_gmem_ptr(dQ), make_shape(SQ, HD), make_stride(HD, _1{}));
-  Tensor mK = make_tensor(make_gmem_ptr(dK), make_shape(SK, HD), make_stride(HD, _1{}));
-  Tensor mV = make_tensor(make_gmem_ptr(dV), make_shape(HD, SK), make_stride(SK, _1{}));
+  Tensor mQ = make_tensor(make_gmem_ptr(dQ), make_shape(SQ, HD, 1), make_stride(HD, _1{}, SQ * HD));
+  Tensor mK = make_tensor(make_gmem_ptr(dK), make_shape(SK, HD, 1), make_stride(HD, _1{}, SK * HD));
+  Tensor mV = make_tensor(make_gmem_ptr(dV), make_shape(HD, SK, 1), make_stride(SK, _1{}, HD * SK));
   Tensor mSFQ = make_tensor(make_gmem_ptr(dSFQ), layoutSFQ);
   Tensor mSFK = make_tensor(make_gmem_ptr(dSFK), layoutSFK);
   Tensor mSFV = make_tensor(make_gmem_ptr(dSFV), layoutSFV);
@@ -108,6 +108,7 @@ int main(int argc, char** argv) {
   params.tma_sfv = make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFV, SmemLayoutSFV{}, make_shape(Int<kSFPadHD>{}, Int<kBlockN>{}), _1{});
   params.layout_sfq = layoutSFQ; params.layout_sfv = layoutSFV;
   params.seqlen_q = SQ; params.seqlen_k = SK; params.n_block_total = n_block_total; params.sm_scale = sm_scale;
+  params.num_qo_heads = 1; params.num_kv_heads = 1;
   params.out_O = dO; params.out_lse = dLSE; params.out_l = dL;
   params.out_Ppre = nullptr; params.out_Mnb = nullptr; params.out_dbg = nullptr;
   params.tile_kv_len = dKV;

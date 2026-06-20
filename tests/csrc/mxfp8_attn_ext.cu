@@ -35,7 +35,7 @@ static std::vector<uint8_t> place_sf(const torch::Tensor& s_cpu, Layout layout,
   auto a = s_cpu.accessor<uint8_t, 2>();
   for (int r = 0; r < rows; ++r)
     for (int b = 0; b < blocks; ++b)
-      h[layout(make_coord(r, b * SFVecSize))] = a[r][b];
+      h[layout(make_coord(r, b * SFVecSize, 0))] = a[r][b];   // single-head: L=0
   return h;
 }
 
@@ -54,9 +54,9 @@ std::vector<torch::Tensor> mxfp8_attn(
   const int NBLK = HD / SFVecSize, NVK = SK / SFVecSize;
 
   // ---- SF gmem: scatter torchao scales into cutlass tiled layouts ----
-  auto layoutSFQ = BlkSF::tile_atom_to_shape_SFA(make_shape(int(SQ), int(kBlockN), int(kHeadDim)));
-  auto layoutSFK = BlkSF::tile_atom_to_shape_SFA(make_shape(int(SK), int(kBlockN), int(kHeadDim)));
-  auto layoutSFV = BlkSF::tile_atom_to_shape_SFB(make_shape(int(kBlockM), int(kHeadDim), int(SK)));
+  auto layoutSFQ = BlkSF::tile_atom_to_shape_SFA(make_shape(int(SQ), int(kBlockN), int(kHeadDim), 1));
+  auto layoutSFK = BlkSF::tile_atom_to_shape_SFA(make_shape(int(SK), int(kBlockN), int(kHeadDim), 1));
+  auto layoutSFV = BlkSF::tile_atom_to_shape_SFB(make_shape(int(kBlockM), int(kHeadDim), int(SK), 1));
   auto hSFQ = place_sf(Qs.to(torch::kCPU).contiguous(), layoutSFQ, SQ, NBLK);
   auto hSFK = place_sf(Ks.to(torch::kCPU).contiguous(), layoutSFK, SK, NBLK);
   auto hSFV = place_sf(Vs.to(torch::kCPU).contiguous(), layoutSFV, HD, NVK);
@@ -81,9 +81,9 @@ std::vector<torch::Tensor> mxfp8_attn(
   auto* dK = reinterpret_cast<Element*>(Kd.data_ptr<uint8_t>());
   auto* dV = reinterpret_cast<Element*>(Vd.data_ptr<uint8_t>());
 
-  Tensor mQ = make_tensor(make_gmem_ptr(dQ), make_shape(SQ, HD), make_stride(HD, _1{}));
-  Tensor mK = make_tensor(make_gmem_ptr(dK), make_shape(SK, HD), make_stride(HD, _1{}));
-  Tensor mV = make_tensor(make_gmem_ptr(dV), make_shape(HD, SK), make_stride(SK, _1{}));
+  Tensor mQ = make_tensor(make_gmem_ptr(dQ), make_shape(SQ, HD, 1), make_stride(HD, _1{}, SQ * HD));
+  Tensor mK = make_tensor(make_gmem_ptr(dK), make_shape(SK, HD, 1), make_stride(HD, _1{}, SK * HD));
+  Tensor mV = make_tensor(make_gmem_ptr(dV), make_shape(HD, SK, 1), make_stride(SK, _1{}, HD * SK));
   Tensor mSFQ = make_tensor(make_gmem_ptr(dSFQ), layoutSFQ);
   Tensor mSFK = make_tensor(make_gmem_ptr(dSFK), layoutSFK);
   Tensor mSFV = make_tensor(make_gmem_ptr(dSFV), layoutSFV);
@@ -97,6 +97,7 @@ std::vector<torch::Tensor> mxfp8_attn(
   params.tma_sfv = make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFV, SmemLayoutSFV{}, make_shape(Int<kSFPadHD>{}, Int<kBlockN>{}), _1{});
   params.layout_sfq = layoutSFQ; params.layout_sfv = layoutSFV;
   params.seqlen_q = SQ; params.seqlen_k = SK; params.n_block_total = n_block_total; params.sm_scale = float(sm_scale);
+  params.num_qo_heads = 1; params.num_kv_heads = 1;
   params.out_O = O.data_ptr<float>(); params.out_lse = LSE.data_ptr<float>();
   params.out_l = dL; params.out_Ppre = Ppre.data_ptr<float>(); params.out_Mnb = dMnb; params.out_dbg = Pdbg.data_ptr<float>();
   params.tile_kv_len = nullptr;

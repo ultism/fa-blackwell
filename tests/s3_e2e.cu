@@ -153,16 +153,16 @@ int main() {
   for (int n = 0; n < SK; ++n) for (int k = 0; k < HD; ++k) hK[n * HD + k] = e4m3_byte(dataVals[(n * 7 + k * 3) % dataVals.size()]);
   for (int h = 0; h < HD; ++h) for (int n = 0; n < SK; ++n) hV[h * SK + n] = e4m3_byte(dataVals[(h * 5 + n * 2) % dataVals.size()]);
 
-  auto layoutSF  = BlkSF::tile_atom_to_shape_SFA(make_shape(int(kBlockM), int(kBlockN), int(kHeadDim)));   // per-block 128x128
-  auto layoutSFQ = BlkSF::tile_atom_to_shape_SFA(make_shape(SQ, int(kBlockN), int(kHeadDim)));
-  auto layoutSFK = BlkSF::tile_atom_to_shape_SFA(make_shape(SK, int(kBlockN), int(kHeadDim)));
+  // SF layouts carry a trailing head (L) mode; this single-head test uses L=1.
+  auto layoutSFQ = BlkSF::tile_atom_to_shape_SFA(make_shape(SQ, int(kBlockN), int(kHeadDim), 1));
+  auto layoutSFK = BlkSF::tile_atom_to_shape_SFA(make_shape(SK, int(kBlockN), int(kHeadDim), 1));
   // V's OWN SFB layout: (head_dim, keys) over the full seqlen_k, scale along keys.
-  auto layoutSFV = BlkSF::tile_atom_to_shape_SFB(make_shape(int(kBlockM), int(kHeadDim), SK));
+  auto layoutSFV = BlkSF::tile_atom_to_shape_SFB(make_shape(int(kBlockM), int(kHeadDim), SK, 1));
   std::vector<uint8_t> hSFQ(cosize(layoutSFQ), 0), hSFK(cosize(layoutSFK), 0), hSFV(cosize(layoutSFV), 0);
-  for (int m = 0; m < SQ; ++m) for (int b = 0; b < NBLK; ++b) hSFQ[layoutSFQ(make_coord(m, b * SFVecSize))] = ue8m0_byte_pow2(qexp[m * NBLK + b]);
-  for (int n = 0; n < SK; ++n) for (int b = 0; b < NBLK; ++b) hSFK[layoutSFK(make_coord(n, b * SFVecSize))] = ue8m0_byte_pow2(kexp[n * NBLK + b]);
+  for (int m = 0; m < SQ; ++m) for (int b = 0; b < NBLK; ++b) hSFQ[layoutSFQ(make_coord(m, b * SFVecSize, 0))] = ue8m0_byte_pow2(qexp[m * NBLK + b]);
+  for (int n = 0; n < SK; ++n) for (int b = 0; b < NBLK; ++b) hSFK[layoutSFK(make_coord(n, b * SFVecSize, 0))] = ue8m0_byte_pow2(kexp[n * NBLK + b]);
   // V SF: index (head_dim_row, key_col), scale block along keys -> spans all NVK=16 key blocks.
-  for (int h = 0; h < HD; ++h) for (int b = 0; b < NVK; ++b) hSFV[layoutSFV(make_coord(h, b * SFVecSize))] = ue8m0_byte_pow2(vexp[h * NVK + b]);
+  for (int h = 0; h < HD; ++h) for (int b = 0; b < NVK; ++b) hSFV[layoutSFV(make_coord(h, b * SFVecSize, 0))] = ue8m0_byte_pow2(vexp[h * NVK + b]);
 
   Element *dQ, *dK, *dV; ElementSF *dSFQ, *dSFK, *dSFV;
   float *dO, *dLSE, *dL, *dPpre, *dMnb;
@@ -178,9 +178,10 @@ int main() {
   CK(cudaMemcpy(dSFK, hSFK.data(), hSFK.size(), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(dSFV, hSFV.data(), hSFV.size(), cudaMemcpyHostToDevice));
 
-  Tensor mQ = make_tensor(make_gmem_ptr(dQ), make_shape(SQ, HD), make_stride(HD, _1{}));
-  Tensor mK = make_tensor(make_gmem_ptr(dK), make_shape(SK, HD), make_stride(HD, _1{}));
-  Tensor mV = make_tensor(make_gmem_ptr(dV), make_shape(HD, SK), make_stride(SK, _1{}));
+  // 3D data tensors (..., head); single-head test uses extent 1.
+  Tensor mQ = make_tensor(make_gmem_ptr(dQ), make_shape(SQ, HD, 1), make_stride(HD, _1{}, SQ * HD));
+  Tensor mK = make_tensor(make_gmem_ptr(dK), make_shape(SK, HD, 1), make_stride(HD, _1{}, SK * HD));
+  Tensor mV = make_tensor(make_gmem_ptr(dV), make_shape(HD, SK, 1), make_stride(SK, _1{}, HD * SK));
   Tensor mSFQ = make_tensor(make_gmem_ptr(dSFQ), layoutSFQ);
   Tensor mSFK = make_tensor(make_gmem_ptr(dSFK), layoutSFK);
   Tensor mSFV = make_tensor(make_gmem_ptr(dSFV), layoutSFV);
@@ -193,6 +194,7 @@ int main() {
   params.tma_sfv = make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFV, SmemLayoutSFV{}, make_shape(Int<kSFPadHD>{}, Int<kBlockN>{}), _1{});
   params.layout_sfq = layoutSFQ; params.layout_sfv = layoutSFV;
   params.seqlen_q = SQ; params.seqlen_k = SK; params.n_block_total = n_block_total; params.sm_scale = sm_scale;
+  params.num_qo_heads = 1; params.num_kv_heads = 1;
   params.out_O = dO; params.out_lse = dLSE; params.out_l = dL; params.out_Ppre = dPpre; params.out_Mnb = dMnb; params.out_dbg = nullptr;
   params.tile_kv_len = nullptr;
 
