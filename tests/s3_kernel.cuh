@@ -161,7 +161,6 @@ using StateV  = cutlass::PipelineState<1>;
 
 struct Params {
   TMA_Q tma_q; TMA_K tma_k; TMA_V tma_v; TMA_SFQ tma_sfq; TMA_SFK tma_sfk; TMA_SFV tma_sfv;
-  LayoutSF layout_sf;           // 128x128 (per-block K)
   LayoutSF layout_sfq;          // seqlen_q x 128 (Q spans all m_blocks)
   LayoutSFV layout_sfv;         // head_dim x seqlen_k (V spans all n_blocks, scale along keys)
   int seqlen_q, seqlen_k, n_block_total;
@@ -263,7 +262,13 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
       Tensor mK   = params.tma_k.get_tma_tensor(make_shape(int(params.seqlen_k), int(kHeadDim)));
       Tensor mV   = params.tma_v.get_tma_tensor(make_shape(int(kHeadDim), int(params.seqlen_k)));
       Tensor mSFQ = params.tma_sfq.get_tma_tensor(shape(params.layout_sfq));
-      Tensor mSFK = params.tma_sfk.get_tma_tensor(shape(params.layout_sf));
+      // Full SFK nominal shape, built in-kernel from seqlen_k (tile_atom_to_shape_SFA is
+      // CUTE_HOST_DEVICE). Matches FlashInfer's get_tma_tensor(shape(layout_SFK)) so the
+      // n-block index stays WITHIN the nominal shape -- no reliance on out-of-nominal
+      // arithmetic tile coordinates. The descriptor (host, over the full/packed SFK) is
+      // unchanged, so addressing is byte-identical to the old per-block-nominal form.
+      Tensor mSFK = params.tma_sfk.get_tma_tensor(
+          shape(BlkSF::tile_atom_to_shape_SFA(make_shape(int(params.seqlen_k), int(kBlockN), int(kHeadDim)))));
       Tensor mSFV = params.tma_sfv.get_tma_tensor(shape(params.layout_sfv));
       auto bq = params.tma_q.get_slice(_0{}); auto bsq = params.tma_sfq.get_slice(_0{});
       auto bk = params.tma_k.get_slice(_0{}); auto bsk = params.tma_sfk.get_slice(_0{});
@@ -274,14 +279,23 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
 
       for (auto work = scheduler.get_initial_work(sched_params); work.is_valid(sched_params);
            work = scheduler.get_next_work(sched_params, work)) {
-        int const m_block = get<0>(work.get_block_coord(sched_params));
-        int const nb_tile = params.tile_kv_len ? (params.tile_kv_len[m_block] + kBlockN - 1) / kBlockN : n_block_total;
+        // S6a: ragged work-tuple. Dense schedulers return qo_indptr=kv_indptr=0 and
+        // qo_len/kv_len = the single problem's lengths, so this degenerates bit-exactly.
+        // Every request is 128-padded along its sequence, so qo_indptr/kv_indptr are
+        // multiples of the tile (one request-tile-base offset addresses data AND blocked SF).
+        auto const bc = work.get_block_coord(sched_params);
+        int const q_tile_local = get<0>(bc);
+        int const qo_indptr = get<3>(bc), kv_indptr = get<4>(bc), kv_len = get<6>(bc);
+        int const q_tile_global = qo_indptr / kBlockM + q_tile_local;
+        int const kv_tile_base  = kv_indptr / kBlockN;
+        int const nb_tile = params.tile_kv_len ? (params.tile_kv_len[q_tile_local] + kBlockN - 1) / kBlockN
+                                               : (kv_len + kBlockN - 1) / kBlockN;
         int const n_block_max = Causal
-            ? cute::min(nb_tile, ((m_block + 1) * kBlockM + kBlockN - 1) / kBlockN)
+            ? cute::min(nb_tile, ((q_tile_local + 1) * kBlockM + kBlockN - 1) / kBlockN)
             : nb_tile;
 
-        Tensor gQ   = local_tile(mQ,   select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
-        Tensor gSFQ = local_tile(mSFQ, select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
+        Tensor gQ   = local_tile(mQ,   select<0, 2>(TileShape_MNK{}), make_coord(q_tile_global, _0{}));
+        Tensor gSFQ = local_tile(mSFQ, select<0, 2>(TileShape_MNK{}), make_coord(q_tile_global, _0{}));
         Tensor gK   = local_tile(mK,   select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));            // (N,K,nb)
         Tensor gSFK = local_tile(mSFK, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
         Tensor gV   = local_tile(mV,   make_shape(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_0{}, _));  // (hd,N,nb)
@@ -297,12 +311,13 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         ++wq;
         for (int nb = 0; nb < n_block_max; ++nb) {
           pipeline_k.producer_acquire(wk);
-          copy(params.tma_k.with(*pipeline_k.producer_get_barrier(wk), 0), tKgK(_, nb), tKsK(_, wk.index()));
-          copy(params.tma_sfk.with(*pipeline_k.producer_get_barrier(wk), 0), tKgSFK(_, nb), tKsSFK(_, wk.index()));
+          int const nbg = kv_tile_base + nb;   // global key-tile index into the packed K/V
+          copy(params.tma_k.with(*pipeline_k.producer_get_barrier(wk), 0), tKgK(_, nbg), tKsK(_, wk.index()));
+          copy(params.tma_sfk.with(*pipeline_k.producer_get_barrier(wk), 0), tKgSFK(_, nbg), tKsSFK(_, wk.index()));
           ++wk;
           pipeline_v.producer_acquire(wv);
-          copy(params.tma_v.with(*pipeline_v.producer_get_barrier(wv), 0), tVgV(_, nb), tVsV);
-          copy(params.tma_sfv.with(*pipeline_v.producer_get_barrier(wv), 0), tVgSFV(_, nb), tVsSFV);
+          copy(params.tma_v.with(*pipeline_v.producer_get_barrier(wv), 0), tVgV(_, nbg), tVsV);
+          copy(params.tma_sfv.with(*pipeline_v.producer_get_barrier(wv), 0), tVgSFV(_, nbg), tVsSFV);
           ++wv;
         }
       }
@@ -353,10 +368,15 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
     StateQ rq; StateK rk; StateV rv;
     for (auto work = scheduler.get_initial_work(sched_params); work.is_valid(sched_params);
          work = scheduler.get_next_work(sched_params, work)) {
-      int const m_block = get<0>(work.get_block_coord(sched_params));
-      int const nb_tile = params.tile_kv_len ? (params.tile_kv_len[m_block] + kBlockN - 1) / kBlockN : n_block_total;
+      auto const bc = work.get_block_coord(sched_params);
+      int const q_tile_local = get<0>(bc);
+      int const qo_indptr = get<3>(bc), kv_indptr = get<4>(bc), qo_len = get<5>(bc), kv_len = get<6>(bc);
+      int const q_tile_global = qo_indptr / kBlockM + q_tile_local;
+      int const kv_tile_base  = kv_indptr / kBlockN;
+      int const nb_tile = params.tile_kv_len ? (params.tile_kv_len[q_tile_local] + kBlockN - 1) / kBlockN
+                                             : (kv_len + kBlockN - 1) / kBlockN;
       int const n_block_max = Causal
-          ? cute::min(nb_tile, ((m_block + 1) * kBlockM + kBlockN - 1) / kBlockN)
+          ? cute::min(nb_tile, ((q_tile_local + 1) * kBlockM + kBlockN - 1) / kBlockN)
           : nb_tile;
 
       // online-softmax row state (this thread owns 2 rows).
@@ -394,15 +414,20 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             make_layout(get<0, 0>(accS.layout()), get<2>(accS.layout()))));
         constexpr int kNRow = 2, kNCol = 32;
 
-        if constexpr (Causal) {
+        // request-local masking. Causal diagonal uses request-local coords (qo_len==kv_len
+        // in slice-1 -> diagonal at local 0). partial_n drops padded keys past kv_len in the
+        // last tile (non-causal needs this; causal already excludes them via the diagonal).
+        // Dense non-causal full tile: both conditions false -> whole block elided (bit-exact).
+        bool const partial_n = ((nb + 1) * kBlockN > kv_len);
+        if (Causal || partial_n) {
           CUTLASS_PRAGMA_UNROLL
           for (int mi = 0; mi < kNRow; ++mi) {
-            int m_global = m_block * kBlockM + warp * 16 + (lane / 4) + mi * 8;
+            int m_local = q_tile_local * kBlockM + warp * 16 + (lane / 4) + mi * 8;
             CUTLASS_PRAGMA_UNROLL
             for (int ni = 0; ni < kNCol; ++ni) {
               int col = (ni / 2) * 8 + (lane % 4) * 2 + (ni % 2);
-              int n_global = nb * kBlockN + col;
-              if (n_global > m_global) accS_rc(mi, ni) = -INFINITY;
+              int n_local = nb * kBlockN + col;
+              if ((Causal && n_local > m_local) || n_local >= kv_len) accS_rc(mi, ni) = -INFINITY;
             }
           }
         }
@@ -439,11 +464,11 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         // Guarded by the pointer so a timing build (out_Ppre=nullptr) skips the full-P
         // gmem write, which otherwise dominates the kernel time.
         if (params.out_Ppre != nullptr) {
-          Tensor gPre = local_tile(mPpre, select<0, 1>(TileShape_MNK{}), make_coord(m_block, nb));
+          Tensor gPre = local_tile(mPpre, select<0, 1>(TileShape_MNK{}), make_coord(q_tile_global, kv_tile_base + nb));
           copy(accS, thr_qk.partition_C(gPre));
           CUTLASS_PRAGMA_UNROLL
           for (int mi = 0; mi < kNRow; ++mi) {
-            int q = m_block * kBlockM + warp * 16 + (lane / 4) + mi * 8;
+            int q = q_tile_global * kBlockM + warp * 16 + (lane / 4) + mi * 8;
             if ((lane % 4) == 0) params.out_Mnb[q * n_block_total + nb] = row_max[mi];
           } }
 
@@ -474,12 +499,12 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             for (int j = 0; j < 8; ++j) rP_rc(mi, sfi * 8 + j) = quant_e4m3(accS_rc(mi, sfi * 8 + j), se);
             if (!kPConstSF && (lane % 4) == 0) ss.sSFP[q_local * NKB + sfi] = ElementSF::bitcast(uint8_t(se + 127));
             if (params.out_dbg) {     // dequantized requant-P, indexed by logical (q, key)
-              int q = m_block * kBlockM + warp * 16 + (lane / 4) + mi * 8;
+              int q = q_tile_global * kBlockM + warp * 16 + (lane / 4) + mi * 8;
               CUTLASS_PRAGMA_UNROLL
               for (int j = 0; j < 8; ++j) {
                 int ni = sfi * 8 + j;
                 int col = (ni / 2) * 8 + (lane % 4) * 2 + (ni % 2);
-                params.out_dbg[q * params.seqlen_k + nb * kBlockN + col] =
+                params.out_dbg[q * params.seqlen_k + (kv_tile_base + nb) * kBlockN + col] =
                     float(rP_rc(mi, ni)) * exp2f(float(se));
               }
             }
@@ -521,11 +546,11 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         if (params.out_dbg) {       // dequantized requant-P, indexed by logical (q, key)
           CUTLASS_PRAGMA_UNROLL
           for (int r = 0; r < kNRow; ++r) {
-            int q = m_block * kBlockM + warp * 16 + (lane / 4) + r * 8;
+            int q = q_tile_global * kBlockM + warp * 16 + (lane / 4) + r * 8;
             CUTLASS_PRAGMA_UNROLL
             for (int ni = 0; ni < kNCol; ++ni) {
               int col = (ni / 2) * 8 + (lane % 4) * 2 + (ni % 2);
-              params.out_dbg[q * params.seqlen_k + nb * kBlockN + col] =
+              params.out_dbg[q * params.seqlen_k + (kv_tile_base + nb) * kBlockN + col] =
                   float(quant_e4m3(accS_rc(r, ni), kPScaleExp)) * exp2f(float(kPScaleExp));
             }
           }
@@ -591,12 +616,13 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(accO_rc); ++ni) accO_rc(mi, ni) *= inv;
       }
-      Tensor gO = local_tile(mO, select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
+      Tensor gO = local_tile(mO, select<0, 2>(TileShape_MNK{}), make_coord(q_tile_global, _0{}));
       copy(accO, thr_pv.partition_C(gO));
       CUTLASS_PRAGMA_UNROLL
       for (int mi = 0; mi < 2; ++mi) {
-        int q = m_block * kBlockM + warp * 16 + (lane / 4) + mi * 8;
-        if (q < params.seqlen_q && (lane % 4) == 0) {
+        int q_local = q_tile_local * kBlockM + warp * 16 + (lane / 4) + mi * 8;
+        int q = q_tile_global * kBlockM + warp * 16 + (lane / 4) + mi * 8;
+        if (q_local < qo_len && (lane % 4) == 0) {
           params.out_l[q] = row_sum[mi];
           params.out_lse[q] = (row_sum[mi] == 0.f) ? -INFINITY : (row_max[mi] * sm_scale + logf(row_sum[mi]));
         }

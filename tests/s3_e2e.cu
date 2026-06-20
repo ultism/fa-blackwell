@@ -191,7 +191,7 @@ int main() {
   params.tma_sfq = make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFQ, SmemLayoutSFQ{}, make_shape(Int<kBlockM>{}, Int<kSFPadHD>{}), _1{});
   params.tma_sfk = make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFK, SmemLayoutSFK{}(_, _, _0{}), make_shape(Int<kBlockN>{}, Int<kSFPadHD>{}), _1{});
   params.tma_sfv = make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFV, SmemLayoutSFV{}, make_shape(Int<kSFPadHD>{}, Int<kBlockN>{}), _1{});
-  params.layout_sf = layoutSF; params.layout_sfq = layoutSFQ; params.layout_sfv = layoutSFV;
+  params.layout_sfq = layoutSFQ; params.layout_sfv = layoutSFV;
   params.seqlen_q = SQ; params.seqlen_k = SK; params.n_block_total = n_block_total; params.sm_scale = sm_scale;
   params.out_O = dO; params.out_lse = dLSE; params.out_l = dL; params.out_Ppre = dPpre; params.out_Mnb = dMnb; params.out_dbg = nullptr;
   params.tile_kv_len = nullptr;
