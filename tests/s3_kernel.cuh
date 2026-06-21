@@ -68,12 +68,29 @@ constexpr int  kPScaleExp     = -8;            // fixed: scale = 2^-se = 256.0
 #ifndef S3_P_SMEM
 #define S3_P_SMEM 0
 #endif
+
+// S6a (serving): partial last KV block "kFillZero" for V. When kv_len is not a
+// multiple of kBlockN (the common case once prefix/chunked masking is on), the
+// padded keys [valid, kBlockN) of the last block are loaded into smem as whatever
+// the producer's buffer holds. The QK mask sets their P=0, but PV still reads V +
+// V-SF for ALL keys: a NaN byte in the padded V data (e4m3 0x7F/0xFF) OR its SF
+// (ue8m0 0xFF) makes 0*NaN=NaN, poisoning accO. K is immune (masked to -inf BEFORE
+// softmax); V is not -- the same K/V asymmetry FlashInfer's NVFP4 prefill fixes with
+// a kFillZero V-SF load. We can't predicate a TMA load per-row, so we sanitize in
+// smem/registers: zero the padded V DATA columns in sV (covers the straddling block's
+// masked keys, whose 32-block SF is real/finite for the valid keys it shares) and
+// finite-ize tOrSFV for the fully-masked 32-key tiles (whose SF may be garbage NaN).
+// Set 0 to reproduce the 0*NaN poison (the adversarial test injects 0xFF pad).
+#ifndef S3_V_KFILLZERO
+#define S3_V_KFILLZERO 1
+#endif
 constexpr int NBLK = kHeadDim / SFVecSize;        // SF blocks along head_dim (QK contraction)
 constexpr int NKB  = kBlockN / SFVecSize;         // SF blocks along keys (PV contraction) = 4
 constexpr int kNWarps = 12, kNThreads = kNWarps * 32;     // 384
 constexpr int NumMmaThreads = 256, NumCopyThreads = 128;
 constexpr float kLog2e = 1.4426950408889634f;
 constexpr int kQuantBarrier = 0;                  // named barrier id for P-smem handoff
+constexpr int kVFillBarrier = 1;                  // named barrier id for partial-block V kFillZero
 
 using AtomMXF8 = cute::SM120::BLOCKSCALED::SM120_16x8x32_TN_VS<
     Element, Element, float, ElementSF, SFVecSize>;
@@ -602,8 +619,35 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         for (int i = 0; i < size(tOrSFP); ++i) tOrSFP(i) = ElementSF::bitcast(uint8_t(kPScaleExp + 127));
 #endif
         { auto t = pipeline_v.consumer_try_wait(rv); pipeline_v.consumer_wait(rv, t);
+#if S3_V_KFILLZERO
+          // Partial last block: zero the padded V DATA columns [valid, kBlockN) so a NaN there
+          // can't meet masked P (0*NaN=NaN). One cooperative pass + barrier before the ldmatrix.
+          if (partial_n) {
+            int const valid = kv_len - nb * kBlockN;          // valid keys in this block, 1..kBlockN
+            int const npad  = kBlockN - valid;                // padded keys [valid, kBlockN)
+            Tensor sV_pi = as_position_independent_swizzle_tensor(sV);
+            for (int idx = tid; idx < kHeadDim * npad; idx += NumMmaThreads)
+              sV_pi(idx / npad, valid + idx % npad) = Element(0);
+            cutlass::arch::NamedBarrier(NumMmaThreads, kVFillBarrier).sync();
+          }
+#endif
           copy(scV, tscV.partition_S(as_position_independent_swizzle_tensor(sV)), tscV.retile_D(tOrV));
           copy(scSFV, tscSFV.partition_S(as_position_independent_swizzle_tensor(sSFV)), tscSFV.retile_D(tOrSFV)); }
+#if S3_V_KFILLZERO
+        // Fully-masked 32-key tiles (all keys >= kv_len) may carry a garbage NaN SF (ue8m0 0xFF);
+        // replace with a finite byte. Their DATA was zeroed above. The straddling tile keeps its
+        // real SF (shared with valid keys), whose masked keys are already 0 in the data.
+        if (partial_n) {
+          int const valid = kv_len - nb * kBlockN;
+          CUTLASS_PRAGMA_UNROLL
+          for (int k = 0; k < NKB; ++k)
+            if (k * SFVecSize >= valid) {
+              Tensor sfk = tOrSFV(_, _, k);
+              CUTLASS_PRAGMA_UNROLL
+              for (int i = 0; i < size(sfk); ++i) sfk(i) = ElementSF::bitcast(uint8_t(0));
+            }
+        }
+#endif
 
         // ---- PV into a FRESH block accumulator, then telescope onto the running accO ----
         // accO = accO*scores_scale + accB (accO is never itself a gemm target). accB native

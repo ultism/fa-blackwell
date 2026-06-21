@@ -5,6 +5,116 @@ first. Each entry: what bit us, the measured evidence, and the actionable rule.
 
 ---
 
+## Block-scale PV: a masked key with `P==0` still poisons `accO` if its padded V is NaN — the hardware mxf8 MMA computes `0 * NaN = NaN`, and the QK mask does NOT protect the V side
+
+**TL;DR:** When `kv_len` is not a multiple of `kBlockN`, the last K/V tile is **partial**:
+the padded keys `[kv_len, kBlockN)` are loaded into smem as whatever the buffer holds. The
+QK mask sets their softmax weight `P = 0` **exactly** (`accS = -inf → exp2 = 0 → e4m3 0x00`),
+so on the QK side they vanish. But **PV reads V (data **and** SF) for ALL keys including the
+masked ones**, and the SM120 block-scaled MMA `SM120_16x8x32_TN_VS` propagates `0 * NaN = NaN`
+(it is **not** absorbed to 0). A padded **V-DATA** byte that is e4m3 NaN (`0x7F`/`0xFF`) **or**
+a padded **V-SF** byte that is ue8m0 NaN (`0xFF`) therefore turns `0 * NaN` into `NaN`, which
+poisons the **entire** `accO` row (every head_dim column) → the whole query row's `O` is NaN.
+This is the **K/V asymmetry**: K is masked to `-inf` *before* softmax so its garbage (even NaN)
+never reaches an accumulator; **V is read *after*, and `P==0` is not a shield against NaN.**
+
+**How it bit us (and the proof).** Partial-len requests (`kv_len` 200/360) with the pad
+gap poisoned `0xFF` (`tests/s6a_ragged.cu`): **no-fix → `ragged=nan`, `bad=71680`** on exactly
+those requests; with the fix → `O max|abs| == 0` bit-exact. This is the SAME failure FlashInfer's
+NVFP4 prefill guards against with a `kFillZero` V-SF load (`prefill.cuh:531-532`: *"0 (softmax
+weight) * NaN (uninitialized SF) = NaN"*) — except theirs is **software** (`__hmul2` the SF into
+an upcast-bf16 V, strict-IEEE in CUDA cores), while ours is the **hardware** block-scaled MMA and
+it bites identically. (Note: FlashInfer has **no MXFP8 block-scale attention** at all — only
+NVFP4; MXFP8 block-scale lives only in their GEMM templates.)
+
+**Why it's a footgun.** Our design 128-pads **per request** (descriptor extent = padded len),
+so TMA never sees the partial block as OOB → no free TMA OOB-zero (unlike FlashInfer's *tight*-
+packed ragged, where an interior partial block reads the **next** request's FINITE data and only
+the buffer tail is hardware-zeroed). The gap between requests is genuinely uninitialized. A real
+recycled/paged KV-cache tail is exactly this. And `P==0` *looks* like it should make the term
+vanish — it doesn't.
+
+**Rule — kFillZero the partial block's V before PV (gated `S3_V_KFILLZERO=1`).** TMA can't
+predicate a load per-row, so sanitize *after* the load, only on `partial_n`: (1) zero the padded
+V-DATA columns `[valid, kBlockN)` in `sV` smem (`as_position_independent_swizzle_tensor(sV)(hd,key)
+= Element(0)` + a `NamedBarrier` before the ldmatrix) — `valid = kv_len - nb*kBlockN`; this also
+covers the **straddling** 32-block's masked keys (whose SF is real/finite, shared with its valid
+keys). (2) Finite-ize the **register** SF fragment `tOrSFV(_,_,k)` for **fully-masked** 32-key
+tiles (`k*SFVecSize >= valid`) — the straddling tile keeps its real SF. **Zero BOTH data and SF:**
+zeroing only data leaves `0 * 2^(NaN_SF)`; zeroing only SF leaves `0 * NaN_data`. (SF is per-32-
+block so you can't zero just the masked keys of a straddling block without corrupting its valid
+keys — hence data-zero handles those, SF-finite-ize handles only fully-masked blocks.)
+
+---
+
+## A `abs(a-b) > tol` differential comparator is BLIND to NaN — `NaN > tol` is `false`, so a NaN kernel output silently certifies as PASS
+
+**TL;DR:** In any numeric diff test, `e = std::abs(a - b); if (e > tol) ++bad;` **cannot detect
+a NaN** result: IEEE makes every ordered comparison with NaN `false`, so `NaN > tol` is `false`
+(not a failure) and `NaN > max_abs` is `false` (so even `max_abs` stays clean). A kernel emitting
+all-NaN sails through as `bad=0, max_abs=0` → **false PASS**.
+
+**How it bit us.** The adversarial `0xFF`-pad test (above) FALSELY PASSED both **with and without**
+the `kFillZero` fix. The tell: poisoning even a **valid** key (which has `P≠0`, so a real NaN must
+propagate) *still* "passed" — impossible unless the comparator was eating NaN. Rewriting to
+`if (!std::isfinite(a) || !(e <= tol)) ++bad;` (note `!(e<=tol)`, which is **true** for NaN, vs
+`e>tol` which is false) immediately exposed `ragged=nan, bad=71680`.
+
+**Rule.** Any differential/oracle test whose kernel *can* produce NaN/Inf (block-scale, softmax,
+division by a row-sum, masked rows) MUST check `isfinite` explicitly — `> tol` alone silently
+certifies NaN as correct. Cousin of the self-replay-vs-independent-oracle lesson (a self-consistent
+test can be blind to a whole bug class); here it was the **comparator itself** that was blind.
+
+---
+
+## TMA: the shape you pass `get_tma_tensor` is only a *nominal* extent — indexing a tile past it does NOT error (arithmetic coords, no bounds check); the host descriptor does the real addressing
+
+**TL;DR:** A CuTe SM90 TMA copy has **two** "tensors". (1) The **descriptor**
+(`CUtensorMap`), baked **host-side** by `make_tma_copy(op, gmem_tensor, …)` from the
+gmem tensor's real base address + global extents + strides + box shape — this is what
+actually generates addresses and does OOB predication, and it is fixed at construction.
+(2) The **coordinate tensor** returned by `get_tma_tensor(shape)` — its "data" is not
+memory but a stream of *coordinates* (engine = `ArithmeticTupleIterator`, basis strides
+`E<0>,E<1>,…`); it only feeds CuTe's layout algebra (`local_tile`/`partition_S`) to decide
+which tile/thread lands at which coordinate. **The `shape` you pass it is purely nominal:
+it sets the coordinate tensor's stated extents (and thus the nominal tile count), but
+`crd2idx` is plain arithmetic `coord·stride` with NO bounds check, so indexing a tile
+index *beyond* that nominal shape silently produces the correct out-of-nominal coordinate,
+which the descriptor (built over the full/packed tensor) then maps correctly.**
+
+**How it bit us (and the proof).** Pre-cleanup our K-SF did
+`mSFK = tma_sfk.get_tma_tensor(shape(layout_sf))` where `layout_sf` was the **per-128-block**
+`(128,128)` SF layout — nominal key-block count **1** — yet the producer indexed
+`tKgSFK(_, nb)` for `nb = 0..3` and loaded all four K-SF blocks **correctly**. A probe
+(`tests/sf_tma_probe.cu`, since removed) confirmed: `local_tile` reports the n-block mode
+`size = 1`, but `gSFK(key=0, hd=0, nb)` for `nb=0,1,2,3` returns block-coords `0,1,2,3` —
+no error, no clamp. The descriptor (built host-side over the **full** `SFA(SK,…)`) does the
+addressing; the nominal `(128,128)` shape only ever governed the (ignored) bound.
+
+**Why it's a footgun, not a feature.** Because TMA has **no bounds check anywhere**, a
+mis-address (wrong base, wrong tile index, wrong head/batch stride) does **not** crash and
+does **not** error — it silently reads the wrong gmem region (or hardware-OOB → zero-fill).
+The *only* thing that catches it is a **bit-exact numerical** differential test
+(our ragged/GQA tests assert `O max|abs| == 0` vs a per-request/per-head dense oracle).
+
+**Rule — don't rely on out-of-nominal indexing in production code, even though it works.**
+Every FlashInfer / CUTLASS TMA kernel passes the **FULL** global shape to `get_tma_tensor`
+for data *and* SF (`hopper/mainloop.cuh:166` `layout_Q.shape()`; `blackwell/prefill/
+mainloop_tma_ws.h:468` `shape(layout_SFK)` over full seqlen; `sm100_fmha_*`
+`make_shape(H,D,B)`), and expresses batch/ragged/paged by **offsetting the coordinate
+within** that full shape — they never index past nominal. The CuTe no-bounds-check property
+is universal but they keep `nominal ⊇ index` **by discipline** (readability + intent: the
+shape documents the real extent). We aligned to this (commit `05a8ced`): the kernel now
+builds the **full** SFK nominal shape in-kernel from `seqlen_k` (`+ num_kv_heads` for GQA)
+via the `CUTE_HOST_DEVICE` `tile_atom_to_shape_SFA`, so the n-block / head index always
+stays within nominal. Addressing is byte-identical (the host descriptor never changed) ⇒
+dense + ragged stayed bit-exact + torchao 4/4. The vestigial `params.layout_sf` (per-block)
+field was removed. **Takeaway:** treat the `get_tma_tensor` shape as a *contract that should
+equal the real extent*; matching it costs nothing and removes a silent-mis-address trap that
+a reviewer would (rightly) flag.
+
+---
+
 ## S5: filling one MMA operand from another's accumulator by `__shfl` — work in `recast<uint32>` words and prove the source-word index is warp-uniform
 
 **TL;DR:** To hand P from the QK accumulator (PV is back-to-back with QK) straight into

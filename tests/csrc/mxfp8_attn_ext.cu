@@ -42,13 +42,18 @@ static std::vector<uint8_t> place_sf(const torch::Tensor& s_cpu, Layout layout,
 std::vector<torch::Tensor> mxfp8_attn(
     torch::Tensor Qd, torch::Tensor Kd, torch::Tensor Vd,    // e4m3 uint8: [Sq,d] [Sk,d] [d,Sk]
     torch::Tensor Qs, torch::Tensor Ks, torch::Tensor Vs,    // ue8m0 uint8: [Sq,d/32] [Sk,d/32] [d,Sk/32]
-    double sm_scale, bool causal) {
+    double sm_scale, bool causal, int64_t kv_len = -1) {
   TORCH_CHECK(Qd.is_cuda() && Kd.is_cuda() && Vd.is_cuda(), "data must be CUDA");
   TORCH_CHECK(Qd.dtype() == torch::kUInt8 && Qs.dtype() == torch::kUInt8, "pass raw e4m3/ue8m0 bytes");
   Qd = Qd.contiguous(); Kd = Kd.contiguous(); Vd = Vd.contiguous();
   const int SQ = Qd.size(0), HD = Qd.size(1), SK = Kd.size(0);
+  // SK is the PADDED (128-tiled) extent for addressing; KVLEN is the real key count the
+  // mask honors. KVLEN<SK exercises the partial-last-block mask + V kFillZero with the
+  // padded tail [KVLEN, SK) free to carry garbage (the test injects 0xFF there).
+  const int KVLEN = (kv_len < 0) ? SK : int(kv_len);
   TORCH_CHECK(HD == kHeadDim, "head_dim must be ", int(kHeadDim), ", got ", HD);
-  TORCH_CHECK(SQ % kBlockM == 0 && SK % kBlockN == 0, "seqlens must tile 128");
+  TORCH_CHECK(SQ % kBlockM == 0 && SK % kBlockN == 0, "padded seqlens must tile 128");
+  TORCH_CHECK(KVLEN > 0 && KVLEN <= SK, "kv_len must be in (0, SK]");
   TORCH_CHECK(Vd.size(0) == HD && Vd.size(1) == SK, "V must be [head_dim, seqlen_k]");
   const int n_block_total = SK / kBlockN, m_block_max = SQ / kBlockM;
   const int NBLK = HD / SFVecSize, NVK = SK / SFVecSize;
@@ -102,7 +107,7 @@ std::vector<torch::Tensor> mxfp8_attn(
   params.out_l = dL; params.out_Ppre = Ppre.data_ptr<float>(); params.out_Mnb = dMnb; params.out_dbg = Pdbg.data_ptr<float>();
   params.tile_kv_len = nullptr;
 
-  Scheduler::Arguments sa{m_block_max, 1, SQ, SK, cutlass::FastDivmod(1)};
+  Scheduler::Arguments sa{m_block_max, 1, SQ, KVLEN, cutlass::FastDivmod(1)};
   Scheduler::Params sp = Scheduler::to_underlying_arguments(sa);
   dim3 grid = Scheduler::get_grid_dim(sa, 132);
   int smem = int(sizeof(SharedStorage));
@@ -125,5 +130,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "S3 WS+TMA MXFP8 prefill attention (torchao oracle)",
         pybind11::arg("Qd"), pybind11::arg("Kd"), pybind11::arg("Vd"),
         pybind11::arg("Qs"), pybind11::arg("Ks"), pybind11::arg("Vs"),
-        pybind11::arg("sm_scale"), pybind11::arg("causal"));
+        pybind11::arg("sm_scale"), pybind11::arg("causal"), pybind11::arg("kv_len") = -1);
 }

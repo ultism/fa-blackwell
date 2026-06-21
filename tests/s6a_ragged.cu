@@ -18,12 +18,18 @@
 // (request, head) pairs -- the cross-request/cross-head addressing trap.
 // ragged==dense (bit-exact) + dense==torchao  =>  ragged==torchao per (request, head).
 //
+// Also exercises the partial-last-block V kFillZero (S3_V_KFILLZERO): the ragged buffers'
+// padding gap [kv_len, kv_pad) is poisoned with NaN bytes (0xFF) for both V data and the
+// fully-padded V-SF blocks. Bit-exact still holds ONLY if the kernel sanitizes them, so masked
+// P=0 never meets 0*NaN=NaN. Rebuild the kernel with -DS3_V_KFILLZERO=0 to see it FAIL (NaN).
+//
 // Build:
 //   nvcc -std=c++17 -O2 -gencode arch=compute_120a,code=sm_120a \
 //     --expt-relaxed-constexpr --expt-extended-lambda \
 //     -I tmp/cutlass/include -I include tests/s6a_ragged.cu -o tests/s6a_ragged
 
 #include <cstdlib>
+#include <cmath>
 #include <algorithm>
 #include <queue>
 #include <vector>
@@ -232,6 +238,24 @@ static int run_config(int num_qo_heads, int num_kv_heads, bool causal) {
     }
   }
 
+  // ---- ADVERSARIAL: poison the V padding gap [kv_len, kv_pad) with NaN bytes (0xFF) on the
+  // RAGGED buffers only (the dense oracle keeps its benign zero pad). Mirrors a real recycled/
+  // uninitialized KV-cache tail. A correct kernel MUST kFillZero these so masked P=0 never
+  // meets 0*NaN=NaN (the K/V asymmetry: K is masked to -inf BEFORE softmax, V is read by PV
+  // for ALL keys). V DATA: every pad key. V-SF: only FULLY-padded 32-blocks -- the straddling
+  // block's SF is shared with its valid keys, so a well-formed cache keeps it finite.
+  // To prove the fix is load-bearing: rebuild the kernel with -DS3_V_KFILLZERO=0 -> expect NaN/FAIL.
+  for (int r = 0; r < B; ++r)
+    for (int hk = 0; hk < num_kv_heads; ++hk) {
+      const int NVK = kv_pad[r] / SFVecSize;
+      for (int h = 0; h < HD; ++h) {
+        for (int n = kv_len[r]; n < kv_pad[r]; ++n)
+          gV[(size_t(hk) * HD + h) * Sk_pad + kv_base[r] + n] = 0xFF;
+        for (int b = cdiv(kv_len[r], SFVecSize); b < NVK; ++b)
+          gSFV[gSFV_l(make_coord(h, kv_base[r] + b * SFVecSize, hk))] = 0xFF;
+      }
+    }
+
   Element *dQ,*dK,*dV; ElementSF *dSFQ,*dSFK,*dSFV; float *dO,*dLSE,*dL,*dMnb;
   cudaMalloc(&dQ, gQ.size()); cudaMalloc(&dK, gK.size()); cudaMalloc(&dV, gV.size());
   cudaMalloc(&dSFQ, gSFQ.size()); cudaMalloc(&dSFK, gSFK.size()); cudaMalloc(&dSFV, gSFV.size());
@@ -295,8 +319,10 @@ static int run_config(int num_qo_heads, int num_kv_heads, bool causal) {
           double a = rO[(size_t(gq) * num_qo_heads + hq) * HD + d];   // token-major O
           double b = Odense[r][hq][size_t(m) * HD + d];
           double e = std::abs(a - b);
-          if (e > max_abs) max_abs = e;
-          if (e > 1e-5) { if (!bad) { fr = r; fh = hq; fm = m; fd = d; } ++bad; }
+          // NaN/Inf-aware: a NaN ragged output (0*NaN poison) must FAIL. `NaN > tol` is false,
+          // so the naive `e > tol` would silently pass it -- use isfinite + !(e <= tol).
+          if (!std::isfinite(a) || !(e <= 1e-5)) { if (!bad) { fr = r; fh = hq; fm = m; fd = d; } ++bad; }
+          if (std::isfinite(e) && e > max_abs) max_abs = e;
         }
       }
   printf("  [qo=%d kv=%d g=%d %-10s] grid=%u CTAs %d works | O max|abs|=%.3g LSE max|abs|=%.3g bad=%d\n",
