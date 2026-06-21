@@ -5,6 +5,36 @@ first. Each entry: what bit us, the measured evidence, and the actionable rule.
 
 ---
 
+## Making a TMA load conditional means shrinking `transaction_bytes` in lockstep — the arrival barrier waits on a fixed byte count, so a load you drop without dropping its bytes DEADLOCKS (same hang class as the n_block_max mismatch)
+
+**TL;DR:** S6b's per-tensor-fp8 SFSource (`kUniformFp8`) consumes a mainstream `torch.float8_e4m3fn`
+KV cache that carries **no** scale factors: the kernel synthesizes a uniform byte-127 (`2^0 = 1.0`)
+block scale in registers and **skips every SF TMA load**. But a `PipelineTmaAsync` arrival barrier
+is armed with `transaction_bytes` = the EXACT byte count the producer will deposit; the consumer's
+`consumer_wait` unblocks only once the mbarrier has counted that many bytes arrive. Drop the SF
+`copy(params.tma_sf*…)` *without* subtracting its bytes from `transaction_bytes` and the barrier
+waits forever for bytes that never land → producer and consumer both block → **100% GPU hang, no
+output** (NOT a wrong number) — the SAME failure class as the [n_block_max producer/consumer
+contract](#a-causal-mask-change-in-a-warp-specialized-kernel-is-two-edits) below.
+
+**The contract (a PAIRED edit).** Skip-the-load and shrink-the-byte-count live together. In
+`s3_kernel.cuh`, both are keyed off the same `kLoadSF = (Src == SFSource::kMxFp8)`: (1) the producer
+wraps each SF `copy()` in `if constexpr (kLoadSF)`; (2) the pipeline params set
+`transaction_bytes = kLoadSF ? TmaBytes* : TmaData*` (data-only). `TmaBytes*` was split into
+`TmaData* + TmaSFBytes*` precisely so the data-only count is exact. Q/K/V each TMA BOTH their data
+**and** their SF under ONE barrier, so each barrier's byte count must drop by exactly that operand's
+SF contribution — no more, no less. (The consumer-side `if constexpr` that fills the const-127 SF
+fragment in registers is harmless on its own; it's the *producer load + the byte count* that form
+the deadlock-able contract. Marked `[SF-bytes contract]` at all three sites — grep it.)
+
+**Rule.** Any conditional TMA load sitting behind a single arrival barrier must adjust that
+barrier's expected-bytes in the same breath. If a WS/TMA kernel hangs right after you made a load
+optional, suspect `transaction_bytes` before anything else. (This generalizes the n_block_max
+lesson: a *trip-count* mismatch and a *byte-count* mismatch are the two ways to starve the same
+producer/consumer pipeline into a silent hang.)
+
+---
+
 ## A causal-mask change in a warp-specialized kernel is TWO edits — the producer's `n_block_max` (TMA load bound) and the consumer's must stay byte-identical, or the pipeline DEADLOCKS (100% GPU hang, not a wrong number)
 
 **TL;DR:** Adding the slice-3 append/chunked-causal offset (`offset_q = kv_len - qo_len`, so query

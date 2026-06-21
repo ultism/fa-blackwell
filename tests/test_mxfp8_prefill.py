@@ -111,6 +111,13 @@ def _u8(t):
     return t.view(torch.uint8).contiguous()
 
 
+def to_per_tensor_e4m3(X):
+    """Mainstream per-tensor fp8 cache: ONE scalar per tensor. scale = amax/448 (e4m3 max), so the
+    largest element maps to exactly 448 and nothing saturates. Returns (e4m3 tensor, fp64 scale)."""
+    scale = X.abs().max().clamp_min(1e-12) / 448.0
+    return (X / scale).to(torch.float8_e4m3fn), scale.double()
+
+
 # -------- Stage 1e: full attention O/LSE end-to-end (S3) --------
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
@@ -323,6 +330,81 @@ def test_attn_causal_offset_matches_torchao(qo_len, kv_len, Sk_pad, head_dim=128
     torch.testing.assert_close(LSE.double(), LSE_ref.double(), rtol=2e-3, atol=2e-3)
 
 
+# -------- Stage S6b: per-tensor fp8 cache via the kUniformFp8 SFSource --------
+# The mainstream KV-cache format (FA3 / FlashInfer-fp8 / SageAttention) is per-tensor fp8:
+# torch.float8_e4m3fn data + ONE scalar q/k/v_scale. e4m3 bytes are bit-identical to ours, so a
+# block-scaled mxfp8 kernel is a strict SUPERSET: run the block-scaled MMA with a UNIFORM SF (byte
+# 127 = 2^0) and fold the scalars OUT -- q_scale*k_scale into sm_scale, v_scale into o_scale. The
+# kernel (uniform_sf=True) SKIPS every SF TMA load, so the Qs/Ks/Vs we pass are POISONED with NaN
+# (0xFF): a correct result proves the per-tensor path reads NO scale factors from the cache. The
+# third config also has a partial last KV block with a 0xFF-poisoned V-data tail (a recycled cache
+# tail) to exercise uniform-SF together with the V kFillZero. Independent torchao/torch oracle.
+@pytest.mark.parametrize("causal,Sq,kv_len,Sk_pad", [
+    (False, 512, 512, 512),
+    (True,  512, 512, 512),
+    (False, 256, 460, 512),
+])
+def test_attn_per_tensor_fp8_matches_torchao(causal, Sq, kv_len, Sk_pad, head_dim=128):
+    torch.manual_seed(31 + Sq + int(causal))
+    sm_scale = 1.0 / (head_dim ** 0.5)
+    partial = (kv_len != Sk_pad)
+
+    Q = torch.randn(Sq, head_dim, device="cuda") * torch.randn(Sq, 1, device="cuda").abs() * 2
+    K = torch.randn(Sk_pad, head_dim, device="cuda") * torch.randn(Sk_pad, 1, device="cuda").abs() * 2
+    V = torch.randn(Sk_pad, head_dim, device="cuda") * torch.randn(Sk_pad, 1, device="cuda").abs() * 2
+
+    qQ, q_scale = to_per_tensor_e4m3(Q)                       # [Sq, hd]
+    qK, k_scale = to_per_tensor_e4m3(K)                       # [Sk_pad, hd]
+    qV, v_scale = to_per_tensor_e4m3(V.t().contiguous())      # [hd, Sk_pad]
+
+    dQ, dK, dV = _u8(qQ), _u8(qK), _u8(qV)
+    if partial:
+        dV = dV.clone(); dV[:, kv_len:Sk_pad] = 0xFF         # recycled cache tail (pad-masked keys)
+
+    # POISON every SF with NaN -- uniform_sf=True makes the kernel ignore them entirely.
+    pSF_q = torch.full((Sq, head_dim // 32), 0xFF, dtype=torch.uint8, device="cuda")
+    pSF_k = torch.full((Sk_pad, head_dim // 32), 0xFF, dtype=torch.uint8, device="cuda")
+    pSF_v = torch.full((head_dim, Sk_pad // 32), 0xFF, dtype=torch.uint8, device="cuda")
+
+    sm_folded = sm_scale * q_scale.item() * k_scale.item()   # q_scale*k_scale -> sm_scale
+    O, LSE = ext_attn(head_dim).mxfp8_attn(
+        dQ, dK, dV, pSF_q, pSF_k, pSF_v, sm_folded, causal,
+        kv_len if partial else -1, True, v_scale.item())[:2]  # uniform_sf=True, o_scale=v_scale
+    assert torch.isfinite(O).all(), "kernel O has NaN/Inf -- uniform SF or V kFillZero broke"
+
+    # reference: per-tensor dequant, online replay with the REAL sm_scale + the kernel's fixed-256 P.
+    Qdq, Kdq, Vdq = qQ.double() * q_scale, qK.double() * k_scale, qV.double() * v_scale
+    S = Qdq @ Kdq.t()                                        # [Sq, Sk_pad]
+    if causal:
+        S = S.masked_fill(torch.triu(torch.ones(Sq, Sk_pad, device="cuda", dtype=torch.bool), 1), float("-inf"))
+    if partial:
+        S[:, kv_len:] = float("-inf")
+    NINF = float("-inf")
+    accO = torch.zeros(Sq, head_dim, dtype=torch.float64, device="cuda")
+    row_sum = torch.zeros(Sq, dtype=torch.float64, device="cuda")
+    m_run = torch.full((Sq,), NINF, dtype=torch.float64, device="cuda")
+    for nb in range(Sk_pad // 128):
+        sblk = S[:, nb * 128:(nb + 1) * 128]
+        m_cur = torch.maximum(m_run, sblk.max(dim=1).values)
+        ss = torch.where(m_run == NINF, torch.zeros_like(m_run), torch.exp((m_run - m_cur) * sm_scale))
+        p = torch.exp((sblk - m_cur[:, None]) * sm_scale)
+        p = torch.where(m_cur[:, None] == NINF, torch.zeros_like(p), torch.nan_to_num(p, nan=0.0))
+        row_sum = row_sum * ss + p.sum(dim=1)
+        Vblk = Vdq[:, nb * 128:(nb + 1) * 128].t()
+        Pdq = (p.float() * 256.0).to(torch.float8_e4m3fn).double() / 256.0
+        accO = accO * ss[:, None] + Pdq @ Vblk
+        m_run = m_cur
+    O_ref = accO / row_sum[:, None]
+    LSE_ref = (m_run * sm_scale + torch.log(row_sum)).float()
+    o_abs = (O.double() - O_ref).abs().max().item()
+    lse_abs = (LSE.double() - LSE_ref.double()).abs().max().item()
+    print(f"\nper-tensor fp8 causal={causal} kv_len={kv_len}/{Sk_pad} (q={q_scale.item():.3g} "
+          f"k={k_scale.item():.3g} v={v_scale.item():.3g}): O max|abs|={o_abs:.3g} "
+          f"LSE max|abs|={lse_abs:.3g} | O finite={bool(torch.isfinite(O).all())}")
+    torch.testing.assert_close(O.double(), O_ref, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(LSE.double(), LSE_ref.double(), rtol=2e-3, atol=2e-3)
+
+
 if __name__ == "__main__":
     for hd in [64, 128]:
         test_qk_tile_matches_torchao(hd)
@@ -332,6 +414,9 @@ if __name__ == "__main__":
     for cfg in [(128, 384, 384), (256, 460, 512)]:
         test_attn_causal_offset_matches_torchao(*cfg)
         print(f"attn causal-offset {cfg}: PASS")
+    for cfg in [(False, 512, 512, 512), (True, 512, 512, 512), (False, 256, 460, 512)]:
+        test_attn_per_tensor_fp8_matches_torchao(*cfg)
+        print(f"attn per-tensor fp8 {cfg}: PASS")
     for hd in [64, 128]:
         for c in [False, True]:
             test_attn_matches_torchao(c, hd)

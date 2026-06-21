@@ -84,6 +84,26 @@ constexpr int  kPScaleExp     = -8;            // fixed: scale = 2^-se = 256.0
 #ifndef S3_V_KFILLZERO
 #define S3_V_KFILLZERO 1
 #endif
+
+// S6b (KV dtype contract): SFSource selects WHERE the block-scale factors come from.
+//  - kMxFp8 (default): real per-32 ue8m0 SF streamed via TMA from a block-scaled source
+//    (what s3_e2e + the torchao oracle feed). The full block-scaled MMA. Bit-exact unchanged.
+//  - kUniformFp8: a mainstream PER-TENSOR fp8 cache (torch.float8_e4m3fn + scalar q/k/v_scale,
+//    as FA3 / FlashInfer-fp8 / SageAttention store it). e4m3 bytes are IDENTICAL to ours, so the
+//    DATA path is untouched; only the scale differs. A per-tensor scalar == a block-scaled tensor
+//    with all block exponents EQUAL, so we set every SF block to the uniform byte 127 (2^0 = 1.0)
+//    -> the block-scaled MMA degenerates to a plain fp8 MMA at zero extra cost, and the scalars
+//    fold OUT of the cache: q_scale*k_scale into sm_scale (host) and v_scale into o_scale (the PV
+//    epilogue). The SF TMA loads are SKIPPED ENTIRELY (the cache carries NO scale factors). This
+//    makes block-scaled mxfp8 a strict SUPERSET of per-tensor fp8 -- one kernel eats both.
+//  [SF-bytes contract] SKIPPING the SF TMA means transaction_bytes MUST also drop the SF
+//  contribution (TmaData* without TmaSFBytes*), or the TMA-arrival barrier waits forever for bytes
+//  that never land -> a producer/consumer DEADLOCK (100% GPU hang, no output), the SAME failure
+//  class as the n_block_max contract. The two are paired: skip-the-load and shrink-the-byte-count
+//  live together under `if constexpr (kLoadSF)` / the transaction_bytes ternary -- edit together.
+enum class SFSource : int { kMxFp8 = 0, kUniformFp8 = 1 };
+constexpr uint8_t kUniformSFByte = 127;          // ue8m0 for 2^0 = 1.0 (biased exp 0 + 127)
+
 constexpr int NBLK = kHeadDim / SFVecSize;        // SF blocks along head_dim (QK contraction)
 constexpr int NKB  = kBlockN / SFVecSize;         // SF blocks along keys (PV contraction) = 4
 constexpr int kNWarps = 12, kNThreads = kNWarps * 32;     // 384
@@ -192,6 +212,10 @@ struct Params {
   int num_qo_heads, num_kv_heads;   // GQA: Q indexes qo_head, K/V index kv_head=qo_head/group_size (1,1 = single-head dense)
   int const* tile_kv_len;   // OPTIONAL [num_q_tiles]: per-q-tile key count (variable-cost / varlen proxy); nullptr -> seqlen_k
   float sm_scale;
+  // S6b kUniformFp8: per-tensor v_scale folded into the PV output (O *= o_scale). Defaults to 1.0
+  // so the kMxFp8 path (and every existing call site) is bit-exact. q_scale*k_scale fold into
+  // sm_scale on the host (the score path needs no kernel change -- it already multiplies sm_scale).
+  float o_scale = 1.0f;
   float* out_O;     // token-major [seqlen_q, head_dim, num_qo_heads]: O(q,hd,h) at q*num_qo_heads*head_dim + h*head_dim + hd
   float* out_lse;   // head-major [num_qo_heads, seqlen_q]: lse(h,q) at h*seqlen_q + q
   float* out_l;     // head-major [num_qo_heads, seqlen_q] row_sum (cross-check)
@@ -216,12 +240,18 @@ struct SharedStorage {
   };
 };
 
-static constexpr uint32_t TmaBytesQ =
-    cute::cosize_v<SmemLayoutQ> * sizeof(Element) + cute::cosize_v<SmemLayoutSFQ> * sizeof(ElementSF);
-static constexpr uint32_t TmaBytesK =
-    cute::cosize_v<SmemLayoutK> / kStages * sizeof(Element) + cute::cosize_v<SmemLayoutSFK> / kStages * sizeof(ElementSF);
-static constexpr uint32_t TmaBytesV =
-    cute::cosize_v<SmemLayoutVt> * sizeof(Element) + cute::cosize_v<SmemLayoutSFV> * sizeof(ElementSF);
+// Split data vs SF so the kUniformFp8 SFSource (no SF TMA) can drop the SF contribution from
+// transaction_bytes -- the [SF-bytes contract] above. TmaBytes* (data+SF) keep the kMxFp8 path
+// byte-identical; the kernel picks data-only when !kLoadSF.
+static constexpr uint32_t TmaDataQ = cute::cosize_v<SmemLayoutQ> * sizeof(Element);
+static constexpr uint32_t TmaDataK = cute::cosize_v<SmemLayoutK> / kStages * sizeof(Element);
+static constexpr uint32_t TmaDataV = cute::cosize_v<SmemLayoutVt> * sizeof(Element);
+static constexpr uint32_t TmaSFBytesQ = cute::cosize_v<SmemLayoutSFQ> * sizeof(ElementSF);
+static constexpr uint32_t TmaSFBytesK = cute::cosize_v<SmemLayoutSFK> / kStages * sizeof(ElementSF);
+static constexpr uint32_t TmaSFBytesV = cute::cosize_v<SmemLayoutSFV> * sizeof(ElementSF);
+static constexpr uint32_t TmaBytesQ = TmaDataQ + TmaSFBytesQ;
+static constexpr uint32_t TmaBytesK = TmaDataK + TmaSFBytesK;
+static constexpr uint32_t TmaBytesV = TmaDataV + TmaSFBytesV;
 
 // e4m3 + ue8m0 quant given the block's ue8m0 scale-exponent.
 __device__ __forceinline__ Element quant_e4m3(float v, int scale_exp) {
@@ -245,12 +275,15 @@ __device__ __forceinline__ float quad_reduce(float v, Op op) {
   return v;
 }
 
-template <typename TileScheduler, bool Causal>
+template <typename TileScheduler, bool Causal, SFSource Src = SFSource::kMxFp8>
 __global__ void __launch_bounds__(kNThreads, 1)
 s3_kernel(CUTE_GRID_CONSTANT Params const params,
           CUTE_GRID_CONSTANT typename TileScheduler::Params const sched_params) {
   extern __shared__ char smem_raw[];
   auto& ss = *reinterpret_cast<SharedStorage*>(smem_raw);
+  // kMxFp8 -> stream real per-block SF via TMA; kUniformFp8 -> synthesize a constant byte 127 in
+  // registers and SKIP every SF TMA (paired with the data-only transaction_bytes below).
+  constexpr bool kLoadSF = (Src == SFSource::kMxFp8);
 
   int const wg = cutlass::canonical_warp_group_idx();        // 0=producer
   int const warp_in_wg = cutlass::canonical_warp_idx_sync() % 4;
@@ -258,13 +291,15 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
 
   PipeQ::Params pq; pq.role = (wg == 0) ? PipeQ::ThreadCategory::Producer : PipeQ::ThreadCategory::Consumer;
   pq.is_leader = (threadIdx.x % cutlass::NumThreadsPerWarpGroup == 0); pq.num_consumers = NumMmaThreads;
-  pq.transaction_bytes = TmaBytesQ; PipeQ pipeline_q(ss.pipeline_q, pq, Shape<_1, _1, _1>{});
+  // [SF-bytes contract] data+SF when kLoadSF, data-only otherwise -- MUST match the SF TMA copies
+  // skipped under `if constexpr (kLoadSF)` in the producer, or the barrier hangs (see SFSource).
+  pq.transaction_bytes = kLoadSF ? TmaBytesQ : TmaDataQ; PipeQ pipeline_q(ss.pipeline_q, pq, Shape<_1, _1, _1>{});
   PipeK::Params pk; pk.role = (wg == 0) ? PipeK::ThreadCategory::Producer : PipeK::ThreadCategory::Consumer;
   pk.is_leader = pq.is_leader; pk.num_consumers = NumMmaThreads;
-  pk.transaction_bytes = TmaBytesK; PipeK pipeline_k(ss.pipeline_k, pk, Shape<_1, _1, _1>{});
+  pk.transaction_bytes = kLoadSF ? TmaBytesK : TmaDataK; PipeK pipeline_k(ss.pipeline_k, pk, Shape<_1, _1, _1>{});
   PipeV::Params pv; pv.role = (wg == 0) ? PipeV::ThreadCategory::Producer : PipeV::ThreadCategory::Consumer;
   pv.is_leader = pq.is_leader; pv.num_consumers = NumMmaThreads;
-  pv.transaction_bytes = TmaBytesV; PipeV pipeline_v(ss.pipeline_v, pv, Shape<_1, _1, _1>{});
+  pv.transaction_bytes = kLoadSF ? TmaBytesV : TmaDataV; PipeV pipeline_v(ss.pipeline_v, pv, Shape<_1, _1, _1>{});
   __syncthreads();
 
   Tensor sQ   = make_tensor(make_smem_ptr(ss.sQ.begin()),  SmemLayoutQ{});
@@ -351,17 +386,22 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
 
         pipeline_q.producer_acquire(wq);
         copy(params.tma_q.with(*pipeline_q.producer_get_barrier(wq), 0), bq.partition_S(gQ), bq.partition_D(sQ));
-        copy(params.tma_sfq.with(*pipeline_q.producer_get_barrier(wq), 0), bsq.partition_S(gSFQ), bsq.partition_D(sSFQ));
+        // [SF-bytes contract] SF TMAs skipped for kUniformFp8 (per-tensor cache has no SF); the
+        // consumer synthesizes byte 127 and transaction_bytes above already dropped these bytes.
+        if constexpr (kLoadSF)
+          copy(params.tma_sfq.with(*pipeline_q.producer_get_barrier(wq), 0), bsq.partition_S(gSFQ), bsq.partition_D(sSFQ));
         ++wq;
         for (int nb = 0; nb < n_block_max; ++nb) {
           pipeline_k.producer_acquire(wk);
           int const nbg = kv_tile_base + nb;   // global key-tile index into the packed K/V
           copy(params.tma_k.with(*pipeline_k.producer_get_barrier(wk), 0), tKgK(_, nbg), tKsK(_, wk.index()));
-          copy(params.tma_sfk.with(*pipeline_k.producer_get_barrier(wk), 0), tKgSFK(_, nbg), tKsSFK(_, wk.index()));
+          if constexpr (kLoadSF)
+            copy(params.tma_sfk.with(*pipeline_k.producer_get_barrier(wk), 0), tKgSFK(_, nbg), tKsSFK(_, wk.index()));
           ++wk;
           pipeline_v.producer_acquire(wv);
           copy(params.tma_v.with(*pipeline_v.producer_get_barrier(wv), 0), tVgV(_, nbg), tVsV);
-          copy(params.tma_sfv.with(*pipeline_v.producer_get_barrier(wv), 0), tVgSFV(_, nbg), tVsSFV);
+          if constexpr (kLoadSF)
+            copy(params.tma_sfv.with(*pipeline_v.producer_get_barrier(wv), 0), tVgSFV(_, nbg), tVsSFV);
           ++wv;
         }
       }
@@ -446,7 +486,11 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
 
       { auto t = pipeline_q.consumer_try_wait(rq); pipeline_q.consumer_wait(rq, t);
         copy(scQ, tscQ.partition_S(as_position_independent_swizzle_tensor(sQ)), tscQ.retile_D(tSrQ));
-        copy(scSFQ, tscSFQ.partition_S(as_position_independent_swizzle_tensor(sSFQ)), tscSFQ.retile_D(tSrSFQ));
+        if constexpr (kLoadSF)
+          copy(scSFQ, tscSFQ.partition_S(as_position_independent_swizzle_tensor(sSFQ)), tscSFQ.retile_D(tSrSFQ));
+        else
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(tSrSFQ); ++i) tSrSFQ(i) = ElementSF::bitcast(kUniformSFByte);
         pipeline_q.consumer_release(rq); ++rq; }
 
       for (int nb = 0; nb < n_block_max; ++nb) {
@@ -454,7 +498,11 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         { auto t = pipeline_k.consumer_try_wait(rk); pipeline_k.consumer_wait(rk, t);
           int stage = rk.index();
           copy(scK, tscK.partition_S(as_position_independent_swizzle_tensor(sK(_, _, stage))), tscK.retile_D(tSrK));
-          copy(scSFK, tscSFK.partition_S(as_position_independent_swizzle_tensor(sSFK(_, _, stage))), tscSFK.retile_D(tSrSFK)); }
+          if constexpr (kLoadSF)
+            copy(scSFK, tscSFK.partition_S(as_position_independent_swizzle_tensor(sSFK(_, _, stage))), tscSFK.retile_D(tSrSFK));
+          else
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(tSrSFK); ++i) tSrSFK(i) = ElementSF::bitcast(kUniformSFByte); }
         Tensor accS = partition_fragment_C(mma_qk, select<0, 1>(TileShape_MNK{}));   // ((2,2),1,16)
         clear(accS);
         CUTLASS_PRAGMA_UNROLL
@@ -649,7 +697,11 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
           }
 #endif
           copy(scV, tscV.partition_S(as_position_independent_swizzle_tensor(sV)), tscV.retile_D(tOrV));
-          copy(scSFV, tscSFV.partition_S(as_position_independent_swizzle_tensor(sSFV)), tscSFV.retile_D(tOrSFV)); }
+          if constexpr (kLoadSF)
+            copy(scSFV, tscSFV.partition_S(as_position_independent_swizzle_tensor(sSFV)), tscSFV.retile_D(tOrSFV));
+          else
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(tOrSFV); ++i) tOrSFV(i) = ElementSF::bitcast(kUniformSFByte); }
 #if S3_V_KFILLZERO
         // Fully-masked 32-key tiles (all keys >= kv_len) may carry a garbage NaN SF (ue8m0 0xFF);
         // replace with a finite byte. Their DATA was zeroed above. The straddling tile keeps its
@@ -695,7 +747,8 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
       for (int mi = 0; mi < 2; ++mi) row_sum[mi] = quad_reduce(row_sum[mi], add_op);
       CUTLASS_PRAGMA_UNROLL
       for (int mi = 0; mi < size<0>(accO_rc); ++mi) {
-        float inv = (row_sum[mi] == 0.f) ? 0.f : 1.f / row_sum[mi];
+        // o_scale folds the per-tensor v_scale (kUniformFp8); 1.0 for kMxFp8 -> bit-exact 1/row_sum.
+        float inv = (row_sum[mi] == 0.f) ? 0.f : params.o_scale / row_sum[mi];
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(accO_rc); ++ni) accO_rc(mi, ni) *= inv;
       }

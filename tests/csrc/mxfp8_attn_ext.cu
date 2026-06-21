@@ -42,7 +42,12 @@ static std::vector<uint8_t> place_sf(const torch::Tensor& s_cpu, Layout layout,
 std::vector<torch::Tensor> mxfp8_attn(
     torch::Tensor Qd, torch::Tensor Kd, torch::Tensor Vd,    // e4m3 uint8: [Sq,d] [Sk,d] [d,Sk]
     torch::Tensor Qs, torch::Tensor Ks, torch::Tensor Vs,    // ue8m0 uint8: [Sq,d/32] [Sk,d/32] [d,Sk/32]
-    double sm_scale, bool causal, int64_t kv_len = -1) {
+    double sm_scale, bool causal, int64_t kv_len = -1,
+    // S6b: per-tensor fp8 cache (kUniformFp8). uniform_sf=True -> the kernel SKIPS the SF TMA loads
+    // and synthesizes a uniform byte-127 (2^0) scale, so the Qs/Ks/Vs passed here are IGNORED (the
+    // tests pass 0xFF poison to PROVE it). The caller folds q_scale*k_scale into sm_scale and passes
+    // v_scale as o_scale (O *= o_scale). Defaults reproduce the block-scaled mxfp8 path exactly.
+    bool uniform_sf = false, double o_scale = 1.0) {
   TORCH_CHECK(Qd.is_cuda() && Kd.is_cuda() && Vd.is_cuda(), "data must be CUDA");
   TORCH_CHECK(Qd.dtype() == torch::kUInt8 && Qs.dtype() == torch::kUInt8, "pass raw e4m3/ue8m0 bytes");
   Qd = Qd.contiguous(); Kd = Kd.contiguous(); Vd = Vd.contiguous();
@@ -102,6 +107,7 @@ std::vector<torch::Tensor> mxfp8_attn(
   params.tma_sfv = make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFV, SmemLayoutSFV{}, make_shape(Int<kSFPadHD>{}, Int<kBlockN>{}), _1{});
   params.layout_sfq = layoutSFQ; params.layout_sfv = layoutSFV;
   params.seqlen_q = SQ; params.seqlen_k = SK; params.n_block_total = n_block_total; params.sm_scale = float(sm_scale);
+  params.o_scale = float(o_scale);     // S6b kUniformFp8: per-tensor v_scale (1.0 for the mxfp8 path)
   params.num_qo_heads = 1; params.num_kv_heads = 1;
   params.out_O = O.data_ptr<float>(); params.out_lse = LSE.data_ptr<float>();
   params.out_l = dL; params.out_Ppre = Ppre.data_ptr<float>(); params.out_Mnb = dMnb; params.out_dbg = Pdbg.data_ptr<float>();
@@ -112,12 +118,16 @@ std::vector<torch::Tensor> mxfp8_attn(
   dim3 grid = Scheduler::get_grid_dim(sa, 132);
   int smem = int(sizeof(SharedStorage));
 
-  auto launch = [&](auto causal_c) {
+  auto launch = [&](auto causal_c, auto uniform_c) {
     constexpr bool C = decltype(causal_c)::value;
-    ACHECK(cudaFuncSetAttribute(s3_kernel<Scheduler, C>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    s3_kernel<Scheduler, C><<<grid, kNThreads, smem>>>(params, sp);
+    constexpr SFSource S = decltype(uniform_c)::value ? SFSource::kUniformFp8 : SFSource::kMxFp8;
+    ACHECK(cudaFuncSetAttribute(s3_kernel<Scheduler, C, S>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    s3_kernel<Scheduler, C, S><<<grid, kNThreads, smem>>>(params, sp);
   };
-  if (causal) launch(std::true_type{}); else launch(std::false_type{});
+  auto dispatch_sf = [&](auto causal_c) {
+    if (uniform_sf) launch(causal_c, std::true_type{}); else launch(causal_c, std::false_type{});
+  };
+  if (causal) dispatch_sf(std::true_type{}); else dispatch_sf(std::false_type{});
   ACHECK(cudaGetLastError());
   ACHECK(cudaDeviceSynchronize());
 
@@ -130,5 +140,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "S3 WS+TMA MXFP8 prefill attention (torchao oracle)",
         pybind11::arg("Qd"), pybind11::arg("Kd"), pybind11::arg("Vd"),
         pybind11::arg("Qs"), pybind11::arg("Ks"), pybind11::arg("Vs"),
-        pybind11::arg("sm_scale"), pybind11::arg("causal"), pybind11::arg("kv_len") = -1);
+        pybind11::arg("sm_scale"), pybind11::arg("causal"), pybind11::arg("kv_len") = -1,
+        pybind11::arg("uniform_sf") = false, pybind11::arg("o_scale") = 1.0);
 }
