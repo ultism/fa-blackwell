@@ -47,7 +47,11 @@ std::vector<torch::Tensor> mxfp8_attn(
     // and synthesizes a uniform byte-127 (2^0) scale, so the Qs/Ks/Vs passed here are IGNORED (the
     // tests pass 0xFF poison to PROVE it). The caller folds q_scale*k_scale into sm_scale and passes
     // v_scale as o_scale (O *= o_scale). Defaults reproduce the block-scaled mxfp8 path exactly.
-    bool uniform_sf = false, double o_scale = 1.0) {
+    bool uniform_sf = false, double o_scale = 1.0,
+    // S7 timing: bench_iters>0 -> skip the Ppre/dbg gmem dump (oracle-only) and instead run
+    // warmup + bench_iters timed kernel launches (CUDA events), returning a 5th tensor = ms/iter.
+    int64_t bench_iters = 0) {
+  const bool bench = bench_iters > 0;
   TORCH_CHECK(Qd.is_cuda() && Kd.is_cuda() && Vd.is_cuda(), "data must be CUDA");
   TORCH_CHECK(Qd.dtype() == torch::kUInt8 && Qs.dtype() == torch::kUInt8, "pass raw e4m3/ue8m0 bytes");
   Qd = Qd.contiguous(); Kd = Kd.contiguous(); Vd = Vd.contiguous();
@@ -110,7 +114,10 @@ std::vector<torch::Tensor> mxfp8_attn(
   params.o_scale = float(o_scale);     // S6b kUniformFp8: per-tensor v_scale (1.0 for the mxfp8 path)
   params.num_qo_heads = 1; params.num_kv_heads = 1;
   params.out_O = O.data_ptr<float>(); params.out_lse = LSE.data_ptr<float>();
-  params.out_l = dL; params.out_Ppre = Ppre.data_ptr<float>(); params.out_Mnb = dMnb; params.out_dbg = Pdbg.data_ptr<float>();
+  // bench: nullptr Ppre/dbg -> kernel skips the full-P [SQ,SK] gmem dump that otherwise dominates time.
+  params.out_l = dL; params.out_Mnb = dMnb;
+  params.out_Ppre = bench ? nullptr : Ppre.data_ptr<float>();
+  params.out_dbg  = bench ? nullptr : Pdbg.data_ptr<float>();
   params.tile_kv_len = nullptr;
 
   Scheduler::Arguments sa{m_block_max, 1, SQ, KVLEN, cutlass::FastDivmod(1)};
@@ -127,11 +134,27 @@ std::vector<torch::Tensor> mxfp8_attn(
   auto dispatch_sf = [&](auto causal_c) {
     if (uniform_sf) launch(causal_c, std::true_type{}); else launch(causal_c, std::false_type{});
   };
-  if (causal) dispatch_sf(std::true_type{}); else dispatch_sf(std::false_type{});
+  auto run_once = [&]{ if (causal) dispatch_sf(std::true_type{}); else dispatch_sf(std::false_type{}); };
+  float ms_per_iter = 0.f;
+  if (bench) {
+    for (int i = 0; i < 10; ++i) run_once();            // warmup
+    ACHECK(cudaDeviceSynchronize());
+    cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+    ACHECK(cudaEventRecord(e0));
+    for (int i = 0; i < bench_iters; ++i) run_once();
+    ACHECK(cudaEventRecord(e1));
+    ACHECK(cudaEventSynchronize(e1));
+    float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1);
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    ms_per_iter = ms / float(bench_iters);
+  } else {
+    run_once();
+  }
   ACHECK(cudaGetLastError());
   ACHECK(cudaDeviceSynchronize());
 
   cudaFree(dSFQ); cudaFree(dSFK); cudaFree(dSFV); cudaFree(dL); cudaFree(dMnb);
+  if (bench) return {O, LSE, Pdbg, Ppre, torch::full({1}, double(ms_per_iter), torch::kFloat32)};
   return {O, LSE, Pdbg, Ppre};
 }
 
@@ -141,5 +164,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("Qd"), pybind11::arg("Kd"), pybind11::arg("Vd"),
         pybind11::arg("Qs"), pybind11::arg("Ks"), pybind11::arg("Vs"),
         pybind11::arg("sm_scale"), pybind11::arg("causal"), pybind11::arg("kv_len") = -1,
-        pybind11::arg("uniform_sf") = false, pybind11::arg("o_scale") = 1.0);
+        pybind11::arg("uniform_sf") = false, pybind11::arg("o_scale") = 1.0,
+        pybind11::arg("bench_iters") = 0);
 }
