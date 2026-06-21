@@ -5,6 +5,36 @@ first. Each entry: what bit us, the measured evidence, and the actionable rule.
 
 ---
 
+## A causal-mask change in a warp-specialized kernel is TWO edits — the producer's `n_block_max` (TMA load bound) and the consumer's must stay byte-identical, or the pipeline DEADLOCKS (100% GPU hang, not a wrong number)
+
+**TL;DR:** Adding the slice-3 append/chunked-causal offset (`offset_q = kv_len - qo_len`, so query
+`m` attends keys `[0, m + offset_q]`) means changing **two** things: the masking predicate
+(`n_local > m_local + offset_q`) **and** the `n_block_max` causal bound
+(`ceil((q_tile+1)*kBlockM + offset_q, kBlockN)`). The bound appears in **both** warpgroups — the
+**consumer** uses it to size its QK/softmax/PV loop, and the **producer** (TMA-load warp) uses the
+*same* `n_block_max` to decide how many K/V tiles to stream into the pipeline. I edited only the
+consumer's copy first. For `offset_q > 0` the consumer then `consumer_wait`s on more K-blocks than
+the producer ever `producer_acquire`/loads → the pipeline starves and **both warpgroups block
+forever**. Symptom: the kernel **hangs at 100% GPU utilization** (no output, no error, no NaN) —
+qualitatively different from a masking bug, which returns a *wrong* finite number.
+
+**How it bit us.** After changing only the consumer `n_block_max` (`s3_kernel.cuh` consumer block),
+`tests/s6a_ragged.cu` with the new `kv_len > qo_len` requests hung; `nvidia-smi` showed the test
+process pinned at 100% util with an empty (block-buffered, never-flushed) stdout. The fix was to
+apply the *identical* `offset_q` expression to the **producer's** `n_block_max` (`s3_kernel.cuh`
+producer block — which also had to start reading `qo_len = get<5>(bc)`, previously unused there).
+After matching them: ragged bit-exact `O/LSE max|abs| == 0` at 1/2/36 SM, torchao oracle matches.
+
+**Rule.** In a WS attention kernel, `n_block_max` (and any per-tile loop bound the producer and
+consumer share) is a **contract** between the two warpgroups. Any change to it is a paired edit —
+grep for *every* site that computes it and change them together. A divergence doesn't corrupt
+output, it **hangs**; if a WS kernel pins the GPU with no progress after a loop-bound change,
+suspect a producer/consumer trip-count mismatch first. (Belt-and-suspenders: the dense
+single-tile path has `offset_q == 0`, so this only ever manifests once `kv_len > qo_len` requests
+exist — i.e. it stayed invisible through slices 1–2 and first appeared in slice-3.)
+
+---
+
 ## Block-scale PV: a masked key with `P==0` still poisons `accO` if its padded V is NaN — the hardware mxf8 MMA computes `0 * NaN = NaN`, and the QK mask does NOT protect the V side
 
 **TL;DR:** When `kv_len` is not a multiple of `kBlockN`, the last K/V tile is **partial**:

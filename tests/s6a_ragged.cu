@@ -1,4 +1,4 @@
-// S6a: ragged / variable-length prefill addressing + GQA/MQA (slices 1 & 2).
+// S6a: ragged / variable-length prefill addressing + GQA/MQA + offset_q causal (slices 1-3).
 //
 // Validates the ragged + multi-head TMA addressing in tests/s3_kernel.cuh: the kernel
 // consumes the full BatchPrefillPersistentTileScheduler 8-tuple (qo_indptr/kv_indptr/
@@ -141,8 +141,15 @@ static int* upload(const std::vector<int>& v) {
 static int run_config(int num_qo_heads, int num_kv_heads, bool causal) {
   const int HD = kHeadDim, NBLK = HD / SFVecSize, group = num_qo_heads / num_kv_heads;
   const float sm_scale = 1.0f / std::sqrt((float)HD);
-  // varlen batch; 200/360 are non-128-multiples -> partial last-tile key mask.
-  std::vector<std::pair<int,int>> lens = {{128,128}, {256,256}, {200,200}, {384,384}, {360,360}};
+  // varlen batch. {qo,kv}: 200/360 are non-128-multiples -> partial last-tile key mask.
+  // The last three have kv_len > qo_len (slice-3 offset_q = kv_len - qo_len > 0: append /
+  // chunked-prefill causal). {128,384} clean offset=256; {64,200} offset=136 w/ partial qo
+  // tile AND partial kv; {256,360} offset=104 multi qo-tile w/ partial kv. The dense oracle
+  // runs the SAME kernel per request (SingleTileScheduler also carries qo_len,kv_len), so it
+  // computes the identical offset_q -> this checks ragged ADDRESSING delivers per-request
+  // qo_len/kv_len correctly; the offset MASK MATH is validated by the torchao oracle.
+  std::vector<std::pair<int,int>> lens = {{128,128}, {256,256}, {200,200}, {384,384}, {360,360},
+                                          {128,384}, {64,200}, {256,360}};
   const int B = lens.size();
 
   std::vector<int> qo_len(B), kv_len(B), qo_pad(B), kv_pad(B), qo_base(B), kv_base(B);
@@ -276,9 +283,10 @@ static int run_config(int num_qo_heads, int num_kv_heads, bool causal) {
   std::vector<W> works;
   for (int r = 0; r < B; ++r) {
     int nqt = cdiv(qo_len[r], kBlockM), nkt = cdiv(kv_len[r], kBlockN);
+    int offset = kv_len[r] - qo_len[r];   // slice-3: match the kernel's offset_q n_block_max bound
     for (int hq = 0; hq < num_qo_heads; ++hq)
       for (int qt = 0; qt < nqt; ++qt) {
-        int eff = causal ? std::min(nkt, cdiv((qt + 1) * kBlockM, kBlockN)) : nkt;
+        int eff = causal ? std::min(nkt, cdiv((qt + 1) * kBlockM + offset, kBlockN)) : nkt;
         works.push_back({r, hq, qt, (long)eff});
       }
   }

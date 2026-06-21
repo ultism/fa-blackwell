@@ -312,13 +312,21 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         auto const bc = work.get_block_coord(sched_params);
         int const q_tile_local = get<0>(bc);
         int const qo_head_idx = get<1>(bc), kv_head_idx = get<2>(bc);
-        int const qo_indptr = get<3>(bc), kv_indptr = get<4>(bc), kv_len = get<6>(bc);
+        int const qo_indptr = get<3>(bc), kv_indptr = get<4>(bc), qo_len = get<5>(bc), kv_len = get<6>(bc);
         int const q_tile_global = qo_indptr / kBlockM + q_tile_local;
         int const kv_tile_base  = kv_indptr / kBlockN;
         int const nb_tile = params.tile_kv_len ? (params.tile_kv_len[q_tile_local] + kBlockN - 1) / kBlockN
                                                : (kv_len + kBlockN - 1) / kBlockN;
+        // [n_block_max contract] PRODUCER copy -- this is the TMA-load trip count and it MUST be
+        // byte-identical to the CONSUMER's n_block_max (grep "[n_block_max contract]"; the other
+        // site is in the consumer warpgroup). If they diverge the kernel DEADLOCKS, it does not
+        // misanswer: the consumer waits on K/V tiles the producer never loads (or vice versa) and
+        // both warpgroups block forever (symptom = 100% GPU util, no output/error). offset_q =
+        // kv_len - qo_len is the slice-3 append/causal shift; edit BOTH sites together. See
+        // docs/gotcha.md "A causal-mask change in a warp-specialized kernel is TWO edits".
+        int const offset_q = kv_len - qo_len;
         int const n_block_max = Causal
-            ? cute::min(nb_tile, ((q_tile_local + 1) * kBlockM + kBlockN - 1) / kBlockN)
+            ? cute::min(nb_tile, ((q_tile_local + 1) * kBlockM + offset_q + kBlockN - 1) / kBlockN)
             : nb_tile;
 
         // GQA: slice the head mode (Q/SFQ by qo_head, K/V/SFK/SFV by kv_head). Single-head
@@ -414,8 +422,16 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
       Tensor mO = mO3d(_, _, qo_head_idx);   // GQA: this work-item's output head
       int const nb_tile = params.tile_kv_len ? (params.tile_kv_len[q_tile_local] + kBlockN - 1) / kBlockN
                                              : (kv_len + kBlockN - 1) / kBlockN;
+      // slice-3: append/decode-at-end causal. offset_q = kv_len - qo_len >= 0 (FlashInfer
+      // convention: the qo_len queries sit at the END of the kv_len keys, so request-local
+      // query m attends keys [0, m + offset_q]). qo_len==kv_len (slice-1/2) -> offset_q=0,
+      // both formulas below reduce EXACTLY to the old ones (dense/ragged stay bit-exact).
+      // [n_block_max contract] CONSUMER copy -- MUST stay byte-identical to the PRODUCER's
+      // n_block_max (grep "[n_block_max contract]"; other site is in the producer warpgroup).
+      // Divergence DEADLOCKS the pipeline (not a wrong number) -- see that site + docs/gotcha.md.
+      int const offset_q = kv_len - qo_len;
       int const n_block_max = Causal
-          ? cute::min(nb_tile, ((q_tile_local + 1) * kBlockM + kBlockN - 1) / kBlockN)
+          ? cute::min(nb_tile, ((q_tile_local + 1) * kBlockM + offset_q + kBlockN - 1) / kBlockN)
           : nb_tile;
 
       // online-softmax row state (this thread owns 2 rows).
@@ -453,9 +469,10 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             make_layout(get<0, 0>(accS.layout()), get<2>(accS.layout()))));
         constexpr int kNRow = 2, kNCol = 32;
 
-        // request-local masking. Causal diagonal uses request-local coords (qo_len==kv_len
-        // in slice-1 -> diagonal at local 0). partial_n drops padded keys past kv_len in the
-        // last tile (non-causal needs this; causal already excludes them via the diagonal).
+        // request-local masking. Causal diagonal is shifted by offset_q = kv_len - qo_len
+        // (slice-3): query m attends keys [0, m + offset_q]. qo_len==kv_len -> offset_q=0 ->
+        // diagonal at local 0 (slice-1/2). partial_n drops padded keys past kv_len in the last
+        // tile (non-causal needs this; causal already excludes them via the shifted diagonal).
         // Dense non-causal full tile: both conditions false -> whole block elided (bit-exact).
         bool const partial_n = ((nb + 1) * kBlockN > kv_len);
         if (Causal || partial_n) {
@@ -466,7 +483,7 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             for (int ni = 0; ni < kNCol; ++ni) {
               int col = (ni / 2) * 8 + (lane % 4) * 2 + (ni % 2);
               int n_local = nb * kBlockN + col;
-              if ((Causal && n_local > m_local) || n_local >= kv_len) accS_rc(mi, ni) = -INFINITY;
+              if ((Causal && n_local > m_local + offset_q) || n_local >= kv_len) accS_rc(mi, ni) = -INFINITY;
             }
           }
         }

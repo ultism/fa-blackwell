@@ -256,12 +256,82 @@ def test_attn_partial_kvlen_matches_torchao(head_dim=128):
     torch.testing.assert_close(LSE.double(), LSE_ref.double(), rtol=2e-3, atol=2e-3)
 
 
+# -------- Stage 1e-offset: slice-3 append/chunked causal (offset_q = kv_len - qo_len > 0) --------
+# qo_len < kv_len: the qo_len queries are APPENDED at the end of kv_len keys (decode / chunked
+# prefill), so request-local query m attends keys [0, m + offset_q], offset_q = kv_len - qo_len.
+# This validates the kernel's SHIFTED causal diagonal (s3_kernel.cuh: n_local > m_local + offset_q)
+# AND the matching n_block_max bound. The second config also has kv_len NOT a 128-multiple, so the
+# last n_block is partial AND its padded keys (>= kv_len) are BOTH causally masked and 0xFF-poisoned
+# -> exercises slice-3 together with the V kFillZero. Independent torchao oracle.
+# (offset_q = 0 is already covered by test_attn_matches_torchao's causal case.)
+@pytest.mark.parametrize("qo_len,kv_len,Sk_pad", [(128, 384, 384), (256, 460, 512)])
+def test_attn_causal_offset_matches_torchao(qo_len, kv_len, Sk_pad, head_dim=128):
+    torch.manual_seed(13 + qo_len)
+    offset_q = kv_len - qo_len
+    sm_scale = 1.0 / (head_dim ** 0.5)
+    partial = (kv_len != Sk_pad)
+    first_full_sf = -(-kv_len // 32)
+
+    Q = torch.randn(qo_len, head_dim, device="cuda") * torch.randn(qo_len, 1, device="cuda").abs() * 2
+    K = torch.randn(Sk_pad, head_dim, device="cuda") * torch.randn(Sk_pad, 1, device="cuda").abs() * 2
+    V = torch.randn(Sk_pad, head_dim, device="cuda") * torch.randn(Sk_pad, 1, device="cuda").abs() * 2
+
+    sQ, dQ = to_mx(Q, torch.float8_e4m3fn, 32)
+    sK, dK = to_mx(K, torch.float8_e4m3fn, 32)
+    sV, dV = to_mx(V.t().contiguous(), torch.float8_e4m3fn, 32)
+
+    # poison the padded V tail (partial config only) -- a recycled KV-cache tail. Those keys are
+    # causally masked (P==0) yet 0*NaN=NaN without kFillZero, so this proves the guard fires.
+    dV_k, sV_k = _u8(dV).clone(), _u8(sV).clone()
+    if partial:
+        dV_k[:, kv_len:Sk_pad] = 0xFF
+        sV_k[:, first_full_sf:] = 0xFF
+    O, LSE = ext_attn(head_dim).mxfp8_attn(
+        _u8(dQ), _u8(dK), dV_k, _u8(sQ), _u8(sK), sV_k, sm_scale, True, kv_len)[:2]
+    assert torch.isfinite(O).all(), "kernel O has NaN/Inf -- slice-3 offset mask or kFillZero broke"
+
+    # reference: clean dequant; shifted causal mask via triu(diagonal=offset_q+1), which masks
+    # n - m >= offset_q + 1  <=>  n > m + offset_q, and at the last query (m=qo_len-1) cuts exactly
+    # at n = kv_len -> it SUBSUMES the n >= kv_len pad mask. Replay the kernel's online algo.
+    Qdq, Kdq, Vdq = dequant(dQ, sQ), dequant(dK, sK), dequant(dV, sV)
+    S = (Qdq @ Kdq.t())                              # [qo_len, Sk_pad]
+    mask = torch.triu(torch.ones(qo_len, Sk_pad, device="cuda", dtype=torch.bool), diagonal=offset_q + 1)
+    S = S.masked_fill(mask, float("-inf"))
+    NINF = float("-inf")
+    accO = torch.zeros(qo_len, head_dim, dtype=torch.float64, device="cuda")
+    row_sum = torch.zeros(qo_len, dtype=torch.float64, device="cuda")
+    m_run = torch.full((qo_len,), NINF, dtype=torch.float64, device="cuda")
+    for nb in range(Sk_pad // 128):
+        sblk = S[:, nb * 128:(nb + 1) * 128]
+        m_cur = torch.maximum(m_run, sblk.max(dim=1).values)
+        ss = torch.where(m_run == NINF, torch.zeros_like(m_run), torch.exp((m_run - m_cur) * sm_scale))
+        p = torch.exp((sblk - m_cur[:, None]) * sm_scale)
+        p = torch.where(m_cur[:, None] == NINF, torch.zeros_like(p), torch.nan_to_num(p, nan=0.0))
+        row_sum = row_sum * ss + p.sum(dim=1)
+        Vblk = Vdq[:, nb * 128:(nb + 1) * 128].t()
+        Pdq = (p.float() * 256.0).to(torch.float8_e4m3fn).double() / 256.0   # kernel's fixed scale 256
+        accO = accO * ss[:, None] + Pdq @ Vblk
+        m_run = m_cur
+    O_ref = accO / row_sum[:, None]
+    LSE_ref = (m_run * sm_scale + torch.log(row_sum)).float()
+    o_abs = (O.double() - O_ref).abs().max().item()
+    lse_abs = (LSE.double() - LSE_ref.double()).abs().max().item()
+    print(f"\ncausal-offset qo={qo_len} kv={kv_len} (offset_q={offset_q}, Sk_pad={Sk_pad}, "
+          f"partial={partial}): O max|abs|={o_abs:.3g} LSE max|abs|={lse_abs:.3g} | "
+          f"O finite={bool(torch.isfinite(O).all())}")
+    torch.testing.assert_close(O.double(), O_ref, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(LSE.double(), LSE_ref.double(), rtol=2e-3, atol=2e-3)
+
+
 if __name__ == "__main__":
     for hd in [64, 128]:
         test_qk_tile_matches_torchao(hd)
         print(f"head_dim={hd}: PASS")
     test_attn_partial_kvlen_matches_torchao(128)
     print("attn partial kv_len + V kFillZero: PASS")
+    for cfg in [(128, 384, 384), (256, 460, 512)]:
+        test_attn_causal_offset_matches_torchao(*cfg)
+        print(f"attn causal-offset {cfg}: PASS")
     for hd in [64, 128]:
         for c in [False, True]:
             test_attn_matches_torchao(c, hd)
