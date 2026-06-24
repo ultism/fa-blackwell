@@ -21,6 +21,9 @@ env/
 *.swp
 .DS_Store
 
+# ncu profiler reports are large binaries; regenerate via prof/*.sh harnesses.
+*.ncu-rep
+
 # Build artifacts: compiled CUDA executables are built in-place next to their .cu
 # sources in bench/ and tests/. Ignore everything in those dirs, then re-include
 # only the source files (and let git recurse into subdirs like csrc/, cutlass_ex/).

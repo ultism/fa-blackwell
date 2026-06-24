@@ -7,6 +7,16 @@ first. Each entry: what bit us, the measured evidence, and the actionable rule.
 
 ## The SF 128-granularity that blocks `kBlockN=64` is the sm100 **TMEM** staging format, REUSED on sm120 by inheritance — NOT an sm120 hardware requirement. The sm120 warp QMMA wants literally **1 scale byte per thread** (`SFARegisters = uint8_t[1]`); the interleaved 128-atom means nothing to it.
 
+> **STATUS (2026-06-24): DONE + VALIDATED + COMMITTED** to branch `experiment/s8-real-n64` (commit
+> `3bc93e0`), NOT merged to master. A genuine `kBlockN=64` DATA tile (not consumer sub-tiling) kills the
+> consumer spill (ptxas 780B→**20B**) and runs **~1.4× faster than committed HEAD-128**
+> (bench_ragged varlen+GQA+causal: 1.43/1.40/1.38× on (1,1)/(8,2)/(32,8)). ncu: `long_scoreboard`
+> 2.76→**0.23** (= Sage 0.19), `issue_active` 29→**40%** (= Sage 42%). Mechanism below; the trick is the
+> SF stays the cutlass 128-key atom (decoupled `kSFBlockN=128`), loaded per-64-block at coord `nbg/2`
+> (host 128-pads kv) and **register-indexed to the `nb&1` 64-half** — no native SF rewrite needed. So the
+> "change surface is large" warning at the end of this entry turned out **smaller than feared**: SF gmem
+> layout untouched, only the consumer slice + host kv-pad + the data (not SF) box changed.
+
 **TL;DR:** The whole "SF tile is 128 along its scaled dim, can't do a 64-key block" wall
 (`Sm1xxBlockScaledConfig::Blk_MN = _128`) is **not** the hardware — it's the sm100 (B100/B200) **TMEM**
 scale-factor layout (interleaved so `UTCCP` can stage SF into Tensor Memory for `tcgen05.mma`). sm120
@@ -35,19 +45,41 @@ the consumer register spill that L2-bandwidth-bounds the kernel (entry below).
 **Rule.** On sm120 the block-scaled SF gmem/smem layout is **ours to choose** — the only hardware
 contract is "one ue8m0 per `SFVecSize`-block, delivered to each thread's `SFARegisters[1]` per the
 m16n8k32 thread→scale map." Do NOT treat `Sm1xxBlockScaledConfig`'s 128 as immutable (it is a TMEM
-artifact). A native layout (e.g. K-SF `[keys, head_dim/32]`, V-SF `[head_dim, keys/32]`) tiles cleanly
-at **64** and feeds the 1-byte register directly — unblocking the real `kBlockN=64` that halves the PV
-operands to Sage's 8 regs and kills the spill at the root (vs the failed consumer-only sub-64, which
-faked 64 via no-unroll register-reuse and TRIPLED local traffic). **This supersedes the framing of the
-"head_dim < 128: SF atom is always 128" entry below** (which correctly described the cutlass behavior
-but wrongly implied the 128 is a hardware floor — it's a TMEM-format floor, droppable on sm120). Change
-surface is large (SF gmem layout + smem stage + the smem→register gather + host packing + TMA descriptor)
-and **numerics-sensitive** — one wrong thread→scale mapping silently produces wrong scales; gate every
-step on the independent torchao oracle, not self-replay.
+artifact). **This supersedes the framing of the "head_dim < 128: SF atom is always 128" entry below**
+(which correctly described the cutlass behavior but wrongly implied the 128 is a hardware floor — it's a
+TMEM-format floor, droppable on sm120).
+
+**What we actually shipped (the cheaper path that the SF-128 = TMEM insight unlocked).** We did **not**
+rewrite SF to a native 64-layout — we kept the cutlass 128-key atom and just **half-sliced** it, which is
+far less code and equally correct:
+- The DATA tile is genuinely 64 (`kBlockN=64`) → PV operands `tOrP`/`tOrV` 16→**8 regs** = Sage level →
+  spill gone (the whole point).
+- The SF stays the 128 atom via a decoupled `constexpr int kSFBlockN = max(kBlockN,128) = 128`. The
+  producer loads the full 128-SF box containing the 64-block (coord `sfg = nbg/2`; host 128-pads kv so the
+  atom always aligns). The consumer then **register-indexes the correct 64-half**: QK uses a `subSFK`
+  re-layout to pick the `nb&1` half of SFK; PV indexes `(nb&1)*NKB + k` into SFV. `kNCol = kBlockN/4`.
+- **The half-slice is invisible to self-tests** (s6a dense ref = same kernel, so a swapped half stays
+  bit-exact) — gate it on the **independent torchao oracle replayed at 64-key blocks** (`/tmp/test_real64.py`):
+  a 128-block reference disagrees ~0.3% from P-quant granularity (NOT a bug), the 64-block reference gives
+  ~**5e-6** = exact. This SF-half-swap trap is the one real hazard; everything else is mechanical.
+- De-risked the SF mechanism on the cutlass GEMM example FIRST (`79c_..._mxfp8_..._gemm`): SFB free dim
+  `N=64` tiles natively; the contraction/scale axis `K=64` would fail (`K/SFVecSize/Blk_SF=0`) but we never
+  need K=64. 64-only, guarded by `static_assert(kBlockN==64)`; master stays 128.
 
 ---
 
 ## The dominant `long_scoreboard` is CONSUMER REGISTER SPILL, not K/V TMA latency — PROVEN by ncu-ing SageAttention3 at the IDENTICAL 128×128 tile (it barely spills). Root cause: mxfp8's k32 atom = 4 operand k-tiles vs nvfp4's k64 = 2, so we hold 2× the operand registers → over the 168 ceiling → `accO` spills. (Corrects the "latency/occupancy-bound" framing of the two entries below — that's the symptom, this is the cause.)
+
+> **STATUS (2026-06-24): RESOLVED — the spill WAS the bottleneck; real `kBlockN=64` killed it (~1.4×).**
+> The diagnosis below went through a correction arc worth remembering (see the "two false turns" box at
+> the end of this entry): (1) the original "spill-bound, sub-64 is a +15-18% win" was **FALSE** — sub-64
+> (consumer sub-tiling) is a net **regression** (1.37-1.52× slower) because it cut *static* spill 780→88B
+> but **tripled dynamic local traffic** to ~3.3GB; (2) "spill is a red herring / pipeline hides it" was
+> ALSO wrong — the kernel is **L2-bandwidth-bound and ~85% of L2 traffic is spill reloads** (local 1.66GB;
+> consumer sm120's 99KB smem leaves ~1KB L1 → 1.5% local hit-rate → every spilled value round-trips L2).
+> The real fix = a genuine 64 DATA tile (`accO` loop-carried, no save/restore churn), which dropped ptxas
+> spill 780B→**20B** and won ~1.4×. See the top entry of this file + `[[s8-consumer-spill-bound]]`,
+> `[[sf-128-atom-is-tmem-artifact-not-sm120-hw]]`.
 
 **TL;DR:** A warp-specialized PERSISTENT kernel hides K/V latency via the async producer/consumer
 pipeline at 1 CTA/SM **by design** — low occupancy is NOT the bottleneck (CUTLASS WS GEMMs run 1–2
@@ -105,21 +137,42 @@ project.)
   to fewer *held* registers" is not a clean cute pattern; nobody (incl Sage) does it.
 - knobs tapped: reg_alloc 232→240 only −6% spill (784→736 B); dropping `minBlocks=1` → WORSE (→1180 B).
 
-**The one clean lever (UNVERIFIED): `kBlockN` 128→64.** PV k-tiles 4→2 (= Sage), `accS` 64→32,
-`tOrP`/`tOrV` 16→8; `accO`/`accB` unchanged → PV peak ~176 → ~144 < 168 → should kill the spill.
-Tradeoff: 2× n_blocks = 2× K/V stream, BUT K/V rides the **hidden** TMA pipeline (short_scoreboard)
-while spill `LDL` is **unhidden** (long_scoreboard) — trading unhidden spill-stalls for TMA-hidden
-K/V-stalls could net win (target = Sage 42% issue). Cost: `kBlockN` touches the K SF-keys layout
-(Blk_SF granularity-128 trap), the S5 P-shuffle (4→2 SF blocks along keys), masks/kFillZero/TMA
-tiling, and the `n_block_max` producer/consumer contract (mismatch = GPU hang). A real scoped change.
+**The clean lever — WON: `kBlockN` 128→64 (real DATA tile, NOT consumer sub-tiling).** PV k-tiles 4→2
+(= Sage), `accS` 64→32, `tOrP`/`tOrV` 16→8; `accO`/`accB` unchanged → PV peak ~176 → ~144 < 168 →
+**spill dropped ptxas 780B→20B, ~1.4× faster than HEAD-128** (long_scoreboard 2.76→0.23, issue 29→40% =
+Sage level). The tradeoff prediction held: 2× n_blocks = 2× K/V stream, but K/V rides the **hidden** TMA
+pipeline (short_scoreboard) while spill `LDL` is **unhidden** (long_scoreboard) — trading unhidden spill
+for TMA-hidden K/V netted the win. It touched exactly the predicted surface (SF-keys layout / Blk_SF-128
+trap, the S5 P-shuffle's per-keys SF blocks, masks/kFillZero/TMA tiling, and the `n_block_max`
+producer/consumer contract), resolved per the top entry of this file (SF kept at the 128 atom + half-sliced).
+Committed to branch `experiment/s8-real-n64` (`3bc93e0`), 64-only via `static_assert`, NOT merged.
+
+**TWO FALSE TURNS before the win (don't re-walk them).**
+1. **`sub-64` (consumer sub-tiling) is a CHURN-TRAP, not a fix.** Faking a 64-block by no-unroll
+   register-reuse inside a 128-loop cut ptxas *static* spill 780→88B but **raised dynamic local traffic
+   to ~3.3GB** (operand re-reads + accO save/restore per sub-block) → net **1.37-1.52× SLOWER** than
+   HEAD-128. Static ptxas spill bytes ≠ dynamic local traffic (= L2 bandwidth). A genuine 64 tile keeps
+   `accO` loop-carried (no save/restore) and avoids the churn entirely.
+2. **"spill is a red herring, the persistent pipeline hides it" was ALSO wrong.** It LOOKED true:
+   the committed HEAD-128 was the fastest build yet had long_scoreboard 2.76 (≈ the "2.93 bottleneck"),
+   and `issue_active%` predicted wall-clock better than long_sb. But the deeper probe showed the kernel
+   is **L2-BANDWIDTH-bound (SOL L2 86%) and ~85% of that L2 traffic IS spill** (local_ld 883MB +
+   local_st 779MB = 1.66GB; global LSU ~0 because K/V are tiny fp8 + L2-resident; local **L1 hit-rate
+   1.5%** because 99KB smem leaves ~1KB L1). So the spill's *latency* is hidden but its *bandwidth*
+   saturates L2 — the original spill instinct was right, the *mechanism* was BW not latency. Killing the
+   spill at the root (real-64) is what cashed it in.
 
 **Rule.** For a WS persistent kernel, "low occupancy → latency-bound" is the WRONG diagnosis — the
 pipeline hides K/V latency at 1 CTA/SM by design. Profile `long_scoreboard` at **instruction level**
 (`ncu --page source --print-source sass --metrics ...long_scoreboard`): if `LDL`/`STL` dominate it is
-**register spill**, not memory latency, and the fix is fewer live registers (smaller operand k-tiles /
-fewer accumulator rows), not deeper pipelines or more occupancy. The two entries below describe the
-*symptom* (latency/occupancy at 1 CTA/SM); this spill is the *cause*. NOT a blocker: we beat fa2
-2–2.5× WITH the spill — it's headroom (SM ~37%), not viability.
+**register spill**. But two follow-on traps: (a) `long_scoreboard` ANTI-correlates with wall-clock here
+(the pipeline hides the spill *latency*) — judge by `issue_active%` + the **L2/local-traffic SOL**, not
+long_sb; the spill bites as **L2 bandwidth** (1.5% L1 hit → every reload round-trips L2), not stall
+latency. (b) Cut the spill at the ROOT (fewer live registers via a genuine smaller tile / fewer operand
+k-tiles), NOT by restructuring to a smaller *static* spill number — `sub-64` did the latter and tripled
+dynamic local traffic. The two entries below describe the *symptom* (latency/occupancy at 1 CTA/SM);
+this spill is the *cause*. NOT a blocker even before the fix: we beat fa2 2–2.5× WITH the spill (it was
+headroom, SM ~37%); real-64 then converted the headroom (~1.4× on top).
 
 ## GQA K/V reuse (the "fewer loads" lever) is UNREACHABLE on our 1-CTA/SM design: folding 2 qo_heads into one CTA to share K/V needs a 2nd O accumulator, which SPILLS — and the spill traffic is bigger than the K/V it saved (4.8× slower, `long_scoreboard` 9.4× WORSE)
 
