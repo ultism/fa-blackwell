@@ -121,8 +121,8 @@ static Params make_params(Element* dQ, Element* dK, Element* dV, ElementSF* dSFQ
   p.tma_k   = make_tma_copy(SM90_TMA_LOAD{}, mK, SmemLayoutK{}(_, _, _0{}), select<1, 2>(TileShape_MNK{}), _1{});
   p.tma_v   = make_tma_copy(SM90_TMA_LOAD{}, mV, SmemLayoutVt{}, make_shape(Int<kHeadDim>{}, Int<kBlockN>{}), _1{});
   p.tma_sfq = make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFQ, SmemLayoutSFQ{}, make_shape(Int<kBlockM>{}, Int<kSFPadHD>{}), _1{});
-  p.tma_sfk = make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFK, SmemLayoutSFK{}(_, _, _0{}), make_shape(Int<kBlockN>{}, Int<kSFPadHD>{}), _1{});
-  p.tma_sfv = make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFV, SmemLayoutSFV{}, make_shape(Int<kSFPadHD>{}, Int<kBlockN>{}), _1{});
+  p.tma_sfk = make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFK, SmemLayoutSFK{}(_, _, _0{}), make_shape(Int<kSFBlockN>{}, Int<kSFPadHD>{}), _1{});
+  p.tma_sfv = make_tma_copy<uint16_t>(SM90_TMA_LOAD{}, mSFV, SmemLayoutSFV{}, make_shape(Int<kSFPadHD>{}, Int<kSFBlockN>{}), _1{});
   p.layout_sfq = layoutSFQ; p.layout_sfv = layoutSFV;
   p.seqlen_q = Sq_pad; p.seqlen_k = Sk_pad; p.n_block_total = Sk_pad / kBlockN; p.sm_scale = sm_scale;
   p.num_qo_heads = num_qo_heads; p.num_kv_heads = num_kv_heads;
@@ -156,7 +156,7 @@ static int run_config(int num_qo_heads, int num_kv_heads, bool causal) {
   int Sq_pad = 0, Sk_pad = 0;
   for (int r = 0; r < B; ++r) {
     qo_len[r] = lens[r].first; kv_len[r] = lens[r].second;
-    qo_pad[r] = cdiv(qo_len[r], kBlockM) * kBlockM; kv_pad[r] = cdiv(kv_len[r], kBlockN) * kBlockN;
+    qo_pad[r] = cdiv(qo_len[r], kBlockM) * kBlockM; kv_pad[r] = cdiv(kv_len[r], kSFBlockN) * kSFBlockN;  // 128-pad: SF atoms align w/ requests
     qo_base[r] = Sq_pad; kv_base[r] = Sk_pad; Sq_pad += qo_pad[r]; Sk_pad += kv_pad[r];
   }
 

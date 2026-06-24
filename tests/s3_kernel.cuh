@@ -35,7 +35,17 @@ using ElementSF = cutlass::float_ue8m0_t;
 #ifndef S3_HEAD_DIM
 #define S3_HEAD_DIM 128
 #endif
-constexpr int kHeadDim = S3_HEAD_DIM, kBlockM = 128, kBlockN = 128, SFVecSize = 32, kStages = 2;
+constexpr int kHeadDim = S3_HEAD_DIM, kBlockM = 128, kBlockN = 64, SFVecSize = 32, kStages = 2;
+// SF atom is irreducibly 128-key-aligned (Blk_MN=128, a TMEM-format leftover; see memory
+// sf-128-atom-is-tmem-artifact). So the DATA tile is kBlockN (=64, the register-win lever) but
+// the SF tiles stay 128-key: each 64-key data block loads the 128-key SF atom containing it
+// (redundant for the 2 sibling 64-blocks, cheap since SF is bytes) and the consumer indexes its
+// (nb&1) 64-key half. kSFBlockN decouples the SF key-tile from the data key-tile.
+constexpr int kSFBlockN = cute::max(int(kBlockN), 128);   // = 128
+// This is the real-64 path: the consumer slices the 128-key SF atom to the (nb&1) 64-key half
+// (subSFK / tOrSFV index / kNCol = kBlockN/4). That slicing is correct ONLY for kBlockN==64 (data
+// tile = exactly half the SF atom). kBlockN=128 is the committed kernel on `master` (no slicing).
+static_assert(kBlockN == 64, "real-64 SF-128/data-64 half-slicing assumes kBlockN==64");
 // The block-scaled SF smem atom + TMA box are inherently 128 along the contraction
 // (cutlass Blk_SF granularity); the gmem SF layout pads K to 128 for head_dim < 128
 // too. So all SF tiles use kSFPadHD=128 while the DATA path uses the real kHeadDim
@@ -148,7 +158,7 @@ using sSF_shapeK = decltype(prepend(make_shape(Blk_SF{} / Int<MMA_NSF>{},
 using sSFA_shapeM = decltype(prepend(Int<kBlockM>{} / Blk_MN{}, mnBasicBlockShape{}));
 using sSFA_strideK = decltype(prepend(make_stride(Int<MMA_NSF>{}, Int<kBlockM>{} / Blk_MN{} * Blk_Elems{}), kBasicBlockStride{}));
 using SmemLayoutSFQ = decltype(make_layout(make_shape(sSFA_shapeM{}, sSF_shapeK{}), make_stride(sSF_strideMN{}, sSFA_strideK{})));
-using sSFBTileShape_N = Int<cute::max(int(kBlockN), 128)>;
+using sSFBTileShape_N = Int<kSFBlockN>;
 using sSFB_shapeN = decltype(prepend(sSFBTileShape_N{} / Blk_MN{}, mnBasicBlockShape{}));
 using sSFB_strideK = decltype(prepend(make_stride(Int<MMA_NSF>{}, sSFBTileShape_N{} / Blk_MN{} * Blk_Elems{}), kBasicBlockStride{}));
 using SmemLayoutAtomSFK = decltype(make_layout(make_shape(sSFB_shapeN{}, sSF_shapeK{}), make_stride(sSF_strideMN{}, sSFB_strideK{})));
@@ -169,7 +179,7 @@ using LayoutSF = decltype(BlkSF::tile_atom_to_shape_SFA(make_shape(int(kBlockM),
 // V is the PV B operand [head_dim, keys], block-scaled along KEYS -> SFB layout (head_dim, keys),
 // NOT K's SFA (keys, head_dim). Per-block type for the TMA descriptor; the full
 // (head_dim x seqlen_k) runtime layout has the SAME C++ type (all extents dynamic int).
-using LayoutSFV = decltype(BlkSF::tile_atom_to_shape_SFB(make_shape(int(kBlockM), int(kHeadDim), int(kBlockN), int(1))));
+using LayoutSFV = decltype(BlkSF::tile_atom_to_shape_SFB(make_shape(int(kBlockM), int(kHeadDim), int(kSFBlockN), int(1))));
 
 // S6a-2 (GQA): the data TMA tensors gain a trailing head mode (token-major production
 // layout [token, head, head_dim]: head_dim is stride-1 (inside the box), head is a
@@ -192,10 +202,10 @@ using TMA_SFQ = decltype(make_tma_copy<uint16_t>(
     SmemLayoutSFQ{}, make_shape(Int<kBlockM>{}, Int<kSFPadHD>{}), _1{}));
 using TMA_SFK = decltype(make_tma_copy<uint16_t>(
     SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr(static_cast<ElementSF const*>(nullptr)), LayoutSF{}),
-    SmemLayoutSFK{}(_, _, _0{}), make_shape(Int<kBlockN>{}, Int<kSFPadHD>{}), _1{}));
+    SmemLayoutSFK{}(_, _, _0{}), make_shape(Int<kSFBlockN>{}, Int<kSFPadHD>{}), _1{}));
 using TMA_SFV = decltype(make_tma_copy<uint16_t>(
     SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr(static_cast<ElementSF const*>(nullptr)), LayoutSFV{}),
-    SmemLayoutSFV{}, make_shape(Int<kSFPadHD>{}, Int<kBlockN>{}), _1{}));
+    SmemLayoutSFV{}, make_shape(Int<kSFPadHD>{}, Int<kSFBlockN>{}), _1{}));
 
 using PipeQ  = cutlass::PipelineTmaAsync<1>;
 using PipeK  = cutlass::PipelineTmaAsync<kStages>;
@@ -376,9 +386,9 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         Tensor gQ   = local_tile(mQ,   select<0, 2>(TileShape_MNK{}), make_coord(q_tile_global, _0{}));
         Tensor gSFQ = local_tile(mSFQ, select<0, 2>(TileShape_MNK{}), make_coord(q_tile_global, _0{}));
         Tensor gK   = local_tile(mK,   select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));            // (N,K,nb)
-        Tensor gSFK = local_tile(mSFK, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
+        Tensor gSFK = local_tile(mSFK, make_shape(Int<kSFBlockN>{}, Int<kHeadDim>{}), make_coord(_, _0{}));  // SF tiled by 128-atom
         Tensor gV   = local_tile(mV,   make_shape(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_0{}, _));  // (hd,N,nb)
-        Tensor gSFV = local_tile(mSFV, make_shape(Int<kHeadDim>{}, Int<kBlockN>{}), make_coord(_0{}, _));  // (hd,N,nb)
+        Tensor gSFV = local_tile(mSFV, make_shape(Int<kHeadDim>{}, Int<kSFBlockN>{}), make_coord(_0{}, _));  // SF tiled by 128-atom
         Tensor tKgK = group_modes<0, 3>(bk.partition_S(gK)); Tensor tKsK = group_modes<0, 3>(bk.partition_D(sK));
         Tensor tKgSFK = group_modes<0, 3>(bsk.partition_S(gSFK)); Tensor tKsSFK = group_modes<0, 3>(bsk.partition_D(sSFK));
         Tensor tVgV = group_modes<0, 3>(bv.partition_S(gV)); Tensor tVsV = group_modes<0, 3>(bv.partition_D(sV));   // V depth-1: dest has no stage
@@ -393,15 +403,16 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         ++wq;
         for (int nb = 0; nb < n_block_max; ++nb) {
           pipeline_k.producer_acquire(wk);
-          int const nbg = kv_tile_base + nb;   // global key-tile index into the packed K/V
+          int const nbg = kv_tile_base + nb;   // global 64-key DATA-tile index into the packed K/V
+          int const sfg = nbg / 2;             // 128-key SF-atom index containing this data block (requests 128-padded)
           copy(params.tma_k.with(*pipeline_k.producer_get_barrier(wk), 0), tKgK(_, nbg), tKsK(_, wk.index()));
           if constexpr (kLoadSF)
-            copy(params.tma_sfk.with(*pipeline_k.producer_get_barrier(wk), 0), tKgSFK(_, nbg), tKsSFK(_, wk.index()));
+            copy(params.tma_sfk.with(*pipeline_k.producer_get_barrier(wk), 0), tKgSFK(_, sfg), tKsSFK(_, wk.index()));
           ++wk;
           pipeline_v.producer_acquire(wv);
           copy(params.tma_v.with(*pipeline_v.producer_get_barrier(wv), 0), tVgV(_, nbg), tVsV);
           if constexpr (kLoadSF)
-            copy(params.tma_sfv.with(*pipeline_v.producer_get_barrier(wv), 0), tVgSFV(_, nbg), tVsSFV);
+            copy(params.tma_sfv.with(*pipeline_v.producer_get_barrier(wv), 0), tVgSFV(_, sfg), tVsSFV);
           ++wv;
         }
       }
@@ -439,6 +450,18 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
     auto tscSFV = scSFV.get_thread_slice(tid);
     Tensor sfp_coord = mxfp8::partition_SFA(make_identity_tensor(make_shape(Int<kBlockM>{}, Int<kBlockN>{})), thr_pv);
 
+    // real-64: the SF stays 128-key resident (atom-aligned), the DATA is 64. Slice the QK-B SF
+    // register fragment (mode-1 = (4,4)) to the 64-key half h = nb&1: split the inner 4 into (2,2),
+    // fix the trailing coord to h, regroup -> (4,2)=8 keys matching the 64-key data operand.
+    auto subSFK = [](auto const& f, int h) {
+      auto m1 = get<1>(f.layout()); auto a = get<0>(m1); auto b = get<1>(m1);
+      auto nb = shape(b); auto sb = stride(b);
+      auto t = make_tensor(f.data(), make_layout(get<0>(f.layout()),
+          make_layout(make_shape(shape(a), make_shape(nb / _2{}, _2{})),
+                      make_stride(stride(a), make_stride(sb, sb * (nb / _2{})))),
+          get<2>(f.layout())))(_, make_coord(_, make_coord(_, h)), _);
+      return group_modes<1, 3>(t);
+    };
     auto max_op = [](float a, float b) { return fmaxf(a, b); };
     auto add_op = [](float a, float b) { return a + b; };
 
@@ -505,17 +528,18 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             for (int i = 0; i < size(tSrSFK); ++i) tSrSFK(i) = ElementSF::bitcast(kUniformSFByte); }
         Tensor accS = partition_fragment_C(mma_qk, select<0, 1>(TileShape_MNK{}));   // ((2,2),1,16)
         clear(accS);
+        auto tSrSFK_h = subSFK(tSrSFK, nb & 1);   // 64-key SF half for this data block
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < size<2>(tSrQ); ++k)
           cute::gemm(mma_qk, make_zip_tensor(tSrQ(_, _, k), tSrSFQ(_, _, k)),
-                     make_zip_tensor(tSrK(_, _, k), tSrSFK(_, _, k)), accS);
+                     make_zip_tensor(tSrK(_, _, k), tSrSFK_h(_, _, k)), accS);
         pipeline_k.consumer_release(rk); ++rk;
 
         // reduction view: ((row=2,MMA_M=1),(col=2,MMA_N=16)) = 2 rows x 32 cols.
         Tensor accS_rc = make_tensor(accS.data(), make_layout(
             make_layout(get<0, 1>(accS.layout()), get<1>(accS.layout())),
             make_layout(get<0, 0>(accS.layout()), get<2>(accS.layout()))));
-        constexpr int kNRow = 2, kNCol = 32;
+        constexpr int kNRow = 2, kNCol = kBlockN / 4;
 
         // request-local masking. Causal diagonal is shifted by offset_q = kv_len - qo_len
         // (slice-3): query m attends keys [0, m + offset_q]. qo_len==kv_len -> offset_q=0 ->
@@ -635,11 +659,11 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         static_assert(kPConstSF, "S5 shuffle path needs a fixed P scale (const SF); build -DS3_P_SMEM=1 for the dynamic-scale oracle");
         // Pack this thread's 32 quantized P bytes per q-row into 8 little-endian uint32 words:
         // word g (ni=4g..4g+3) holds keys {16g+2ql, +1, +8, +9} for this lane's ql=lane%4.
-        uint32_t qw[kNRow][8];
+        uint32_t qw[kNRow][kNCol / 4];
         CUTLASS_PRAGMA_UNROLL
         for (int r = 0; r < kNRow; ++r) {
           CUTLASS_PRAGMA_UNROLL
-          for (int g = 0; g < 8; ++g) {
+          for (int g = 0; g < kNCol / 4; ++g) {
             uint32_t w = 0;
             CUTLASS_PRAGMA_UNROLL
             for (int b = 0; b < 4; ++b)
@@ -711,7 +735,7 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
           CUTLASS_PRAGMA_UNROLL
           for (int k = 0; k < NKB; ++k)
             if (k * SFVecSize >= valid) {
-              Tensor sfk = tOrSFV(_, _, k);
+              Tensor sfk = tOrSFV(_, _, (nb & 1) * NKB + k);   // V-SF k-blocks for this 64-key half
               CUTLASS_PRAGMA_UNROLL
               for (int i = 0; i < size(sfk); ++i) sfk(i) = ElementSF::bitcast(uint8_t(0));
             }
@@ -727,7 +751,7 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < size<2>(tOrP); ++k)
           cute::gemm(mma_pv, make_zip_tensor(tOrP(_, _, k), tOrSFP(_, _, k)),
-                     make_zip_tensor(tOrV(_, _, k), tOrSFV(_, _, k)), accB);
+                     make_zip_tensor(tOrV(_, _, k), tOrSFV(_, _, (nb & 1) * NKB + k)), accB);   // V-SF half
         pipeline_v.consumer_release(rv); ++rv;   // release V AFTER the gemm has consumed it
         CUTLASS_PRAGMA_UNROLL
         for (int a = 0; a < 2; ++a) {

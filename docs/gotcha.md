@@ -5,6 +5,199 @@ first. Each entry: what bit us, the measured evidence, and the actionable rule.
 
 ---
 
+## The SF 128-granularity that blocks `kBlockN=64` is the sm100 **TMEM** staging format, REUSED on sm120 by inheritance — NOT an sm120 hardware requirement. The sm120 warp QMMA wants literally **1 scale byte per thread** (`SFARegisters = uint8_t[1]`); the interleaved 128-atom means nothing to it.
+
+**TL;DR:** The whole "SF tile is 128 along its scaled dim, can't do a 64-key block" wall
+(`Sm1xxBlockScaledConfig::Blk_MN = _128`) is **not** the hardware — it's the sm100 (B100/B200) **TMEM**
+scale-factor layout (interleaved so `UTCCP` can stage SF into Tensor Memory for `tcgen05.mma`). sm120
+(consumer Blackwell, RTX 50-series) has **no TMEM** and no `tcgen05`; its block-scaled MMA is the
+**warp-level** `SM120_16x8x32_TN_VS`, whose SF is a plain **register operand**. We only carry the 128
+atom because the cutlass sm120 collective `using`s the sm100 config verbatim. It costs us the spill: the
+128 granularity forces `kBlockN=128` → PV operands stay 4 k-tiles = 16 regs (vs Sage nvfp4's 2 = 8) →
+the consumer register spill that L2-bandwidth-bounds the kernel (entry below).
+
+**The three source facts.**
+- **The atom is the sm100 TMEM format** — `cutlass/detail/sm100_blockscaled_layout.hpp:48-59`:
+  `Blk_MN = _128`; `SfKMajorAtom = Layout<Shape<Shape<_32,_4>,Shape<SFVecSize,_4>>, Stride<Stride<_16,_4>,
+  Stride<_0,_1>>>`. The MN dim `(_32,_4)=128` has strides `(_16,_4)` = **interleaved** (a TMEM/UTCCP bank
+  layout), so `tile_to_shape` makes a 512B indivisible atom → a 64-key box fails (`"CTA_Tile/SLayout
+  top-level size equivalence"`). The K dim's `SFVecSize=32` has stride `_0` — *that* (the broadcast) is
+  the only real hardware fact: one ue8m0 per 32-element block.
+- **sm120 hardware wants 1 byte/thread, no interleave** — `cute/arch/mma_sm120.hpp:1941-1949`
+  (`SM120_16x8x32_TN_VS<…,float_e4m3_t,float,float_ue8m0_t,VS>` and every sibling):
+  `using SFARegisters = uint8_t[1];  using SFBRegisters = uint8_t[1];`. The `QMMA.SF` instruction takes
+  exactly ONE scale byte per thread per operand (that thread's 32-key block). No 128, no interleave.
+- **We inherited it** — `cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp:128`:
+  `using Sm1xxBlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<SFVecSize>;` (and that file greps
+  ZERO for `tcgen05`/`TMEM` — SF rides `gmem→TMA→smem→register`, never TMEM). Our `s3_kernel.cuh:160`
+  `BlkSF = Sm1xxBlockScaledConfig<SFVecSize>` + `tile_atom_to_shape_SFA/SFB` ride it.
+
+**Rule.** On sm120 the block-scaled SF gmem/smem layout is **ours to choose** — the only hardware
+contract is "one ue8m0 per `SFVecSize`-block, delivered to each thread's `SFARegisters[1]` per the
+m16n8k32 thread→scale map." Do NOT treat `Sm1xxBlockScaledConfig`'s 128 as immutable (it is a TMEM
+artifact). A native layout (e.g. K-SF `[keys, head_dim/32]`, V-SF `[head_dim, keys/32]`) tiles cleanly
+at **64** and feeds the 1-byte register directly — unblocking the real `kBlockN=64` that halves the PV
+operands to Sage's 8 regs and kills the spill at the root (vs the failed consumer-only sub-64, which
+faked 64 via no-unroll register-reuse and TRIPLED local traffic). **This supersedes the framing of the
+"head_dim < 128: SF atom is always 128" entry below** (which correctly described the cutlass behavior
+but wrongly implied the 128 is a hardware floor — it's a TMEM-format floor, droppable on sm120). Change
+surface is large (SF gmem layout + smem stage + the smem→register gather + host packing + TMA descriptor)
+and **numerics-sensitive** — one wrong thread→scale mapping silently produces wrong scales; gate every
+step on the independent torchao oracle, not self-replay.
+
+---
+
+## The dominant `long_scoreboard` is CONSUMER REGISTER SPILL, not K/V TMA latency — PROVEN by ncu-ing SageAttention3 at the IDENTICAL 128×128 tile (it barely spills). Root cause: mxfp8's k32 atom = 4 operand k-tiles vs nvfp4's k64 = 2, so we hold 2× the operand registers → over the 168 ceiling → `accO` spills. (Corrects the "latency/occupancy-bound" framing of the two entries below — that's the symptom, this is the cause.)
+
+**TL;DR:** A warp-specialized PERSISTENT kernel hides K/V latency via the async producer/consumer
+pipeline at 1 CTA/SM **by design** — low occupancy is NOT the bottleneck (CUTLASS WS GEMMs run 1–2
+CTA/SM at 80%+). Instruction-level profiling shows the dominant `long_scoreboard` (2.93/issue on
+(8,2) causal varlen) is mostly the **consumer's OWN register-spill reloads** (`LDL` = load-local),
+not K/V waits. The reference SageAttention3, at the *identical* tile/threads/regs, barely spills.
+
+**Instruction-level evidence (`tests/bench_ragged.cu` (8,2) causal + ncu).**
+- ptxas: `Used 168 registers` (the `__launch_bounds__(384,1)` ceiling = 65536/384), **~780B spill**.
+  The runtime `setmaxnreg.inc<232>` does NOT remove what ptxas already baked against 168.
+- ncu `--page source`: **`LDL [R1+0x17c]` is the #1 `long_scoreboard` instruction** (12.5% of all
+  long_scoreboard directly; the dependent FFMA chain reloading the spilled `accO` adds more). The
+  consumer reads K/V from smem = `LDS` = *short*_scoreboard, NOT long. Local-mem traffic **1.66 GB**.
+- `-lineinfo` + nvdisasm: spill concentrated at **the PV/telescope** (`accO = accO*scale + accB`) —
+  the two 64-fp32 accumulators (accO + accB) + the operands exceed 168.
+
+**The decisive proof — ncu the SageAttention3 reference (prebuilt `.so`, runnable).** Sage3
+head_dim=128 = `Flash_fwd_kernel_traits<128,128,128,3>` = the SAME 128×128 tile, 12 warps/384 thr,
+SAME `launch_bounds(384,1)`, SAME `reg_dealloc<24>`/`reg_alloc<232>`, SAME accB-telescope. Causal:
+
+| metric (ncu) | Sage3 (nvfp4) | ours (mxfp8, (8,2)) |
+|---|---|---|
+| `long_scoreboard` /issue | **0.19** | **2.93** |
+| local spill ld / st | **9.88 MB / 0.85 MB** | **883 MB / 779 MB** |
+| `issue_active` | **42.0%** | **29.3%** |
+| registers / occupancy | 168 / 1 CTA | 168 / 1 CTA |
+
+Sage essentially does NOT spill; its stalls are clean `short_scoreboard`+`wait` (a register-resident
+WS attention). **42% issue / 0.19 long_scoreboard is the target if we kill the spill.** Run it:
+prebuilt `tmp/SageAttention/sageattention3_blackwell/fp4attn_cuda.cpython-312*.so` — import torch
+first, `sys.path.insert(0,'.')`, `from sageattn3.api import sageattn3_blackwell`, call on bf16
+[B,H,L,D], `ncu -k regex:compute_attn_ws --launch-skip 1 --launch-count 1`. (A from-source device
+compile FAILS on CUDA 13.3 — its bundled cutlass `prefetch.hpp` + conda-gcc `fenv.h` conflict; use
+the prebuilt `.so`.)
+
+**Root cause = operand k-tile COUNT, not per-MMA width.** Per-MMA operand width is IDENTICAL (both
+4 regs: mxfp8 `SM120_16x8x32` A = m16k32 e4m3 = 16B; nvfp4 `SM120_16x8x64` A = m16k64 e2m1 = 16B).
+But head_dim 128: mxfp8 k32 → **4 k-tiles**, nvfp4 k64 → **2**. cute holds the full operand fragment,
+so `tSrQ`/`tOrP`/`tSrK`/`tOrV` = **16 regs each vs Sage's 8**. Peak: Sage accO 64 + accB 64 + ops ~16
+≈ 145 (fits 168); us 64 + 64 + ops ~32 + temps ≈ 175 (spills). The accumulators are identical for both;
+the operand k-tiles are the whole gap. (nvfp4 vs mxfp8 = a format choice we can't make — mxfp8 is the
+project.)
+
+**Two fixes tried this session — both DEAD (gated, reverted):**
+- **accB elimination / in-place PV** (`S3_INPLACE_PV`): rescale `accO` then `gemm(...,accO)` directly
+  (FA2-style, no per-block `accB`). **4.7× SLOWER** (1.14→5.30 ms), `long_scoreboard` 2.93→4.33, spill
+  784→920 B. `cute::gemm` PINS its C accumulator in registers for the whole gemm — a short-lived
+  per-block `accB` lets ptxas spill the long-lived `accO` COLD/flexibly; making `accO` the MMA target
+  pins all 64 of it across every block → operands spill HOT. **`accB` is a load-bearing escape valve,
+  NOT redundant** — Sage uses the SAME accB-telescope, confirming the baseline.
+- **operand streaming** (`S3_STREAM_V`, single-k-tile reused fragment): **cute structural wall.**
+  `retile_D` (the smem→rmem copy/MMA layout bridge) is built for the FULL operand fragment; a
+  single-k-tile fragment fails to compile (`logical_divide: too many modes in tiler`). Sage's own
+  `copy_v_block` retiles the FULL fragment then slices — it does NOT reduce registers either. "Stream
+  to fewer *held* registers" is not a clean cute pattern; nobody (incl Sage) does it.
+- knobs tapped: reg_alloc 232→240 only −6% spill (784→736 B); dropping `minBlocks=1` → WORSE (→1180 B).
+
+**The one clean lever (UNVERIFIED): `kBlockN` 128→64.** PV k-tiles 4→2 (= Sage), `accS` 64→32,
+`tOrP`/`tOrV` 16→8; `accO`/`accB` unchanged → PV peak ~176 → ~144 < 168 → should kill the spill.
+Tradeoff: 2× n_blocks = 2× K/V stream, BUT K/V rides the **hidden** TMA pipeline (short_scoreboard)
+while spill `LDL` is **unhidden** (long_scoreboard) — trading unhidden spill-stalls for TMA-hidden
+K/V-stalls could net win (target = Sage 42% issue). Cost: `kBlockN` touches the K SF-keys layout
+(Blk_SF granularity-128 trap), the S5 P-shuffle (4→2 SF blocks along keys), masks/kFillZero/TMA
+tiling, and the `n_block_max` producer/consumer contract (mismatch = GPU hang). A real scoped change.
+
+**Rule.** For a WS persistent kernel, "low occupancy → latency-bound" is the WRONG diagnosis — the
+pipeline hides K/V latency at 1 CTA/SM by design. Profile `long_scoreboard` at **instruction level**
+(`ncu --page source --print-source sass --metrics ...long_scoreboard`): if `LDL`/`STL` dominate it is
+**register spill**, not memory latency, and the fix is fewer live registers (smaller operand k-tiles /
+fewer accumulator rows), not deeper pipelines or more occupancy. The two entries below describe the
+*symptom* (latency/occupancy at 1 CTA/SM); this spill is the *cause*. NOT a blocker: we beat fa2
+2–2.5× WITH the spill — it's headroom (SM ~37%), not viability.
+
+## GQA K/V reuse (the "fewer loads" lever) is UNREACHABLE on our 1-CTA/SM design: folding 2 qo_heads into one CTA to share K/V needs a 2nd O accumulator, which SPILLS — and the spill traffic is bigger than the K/V it saved (4.8× slower, `long_scoreboard` 9.4× WORSE)
+
+**TL;DR:** The previous entry guessed GQA K/V reuse ("one CTA serves a kv_head's whole qo_head group")
+might be the lever. We built it as a gated probe (`S3_GQA_FOLD`) and **measured it: catastrophic.**
+The reuse direction is real (fa2 does it) but it is **not affordable on our register-bound design** —
+holding *k* heads' online-softmax O accumulators to share one K/V stream needs *k×* the persistent
+register state, and we are already at the spill floor at 1 CTA/SM.
+
+**The probe.** One CTA processes 2 qo_heads of one kv_head (config (8,4), group=2): K/V TMA-loaded
+ONCE per `n_block`, an inner `for h` loop does both heads' QK→softmax→PV into **two independent
+`accO` accumulators** (the dead S5-path `sP`/`sSFP` smem reused as head-1's `sQ2`/`sSFQ2`, so smem
+didn't grow). Halves the K/V load count vs the per-`qo_head` baseline. Clean A/B, same shape:
+
+| metric (ncu, clock-independent) | baseline (per-qo_head) | FOLD (2 heads/CTA) | |
+|---|---|---|---|
+| wall-clock (8,4) causal | 1.22 ms | **5.86 ms** | **4.8× slower** |
+| `long_scoreboard` /issue | 2.79 | **26.11** | **9.4× WORSE** |
+| local-mem **store** (spill) | 779 MB | **2.60 GB** | 3.3× |
+| local-mem **load** (spill) | 883 MB | **2.74 GB** | 3.1× |
+| SM throughput | 39.0% | **15.5%** | halved |
+| occupancy (warps active) | 18.7% | 18.7% | still 1 CTA/SM |
+
+**Why it backfires.** A 2nd `accO` (64 fp32/thread) pushes the consumer's live registers far past the
+**168-reg static ceiling ptxas allocates under `launch_bounds(384,1)`** (the consumer's runtime
+`setmaxnreg.inc<232>` can't change what ptxas already spilled against 168). Result: **2.6 GB of local
+stores** — *more* memory traffic than the K/V loads the reuse was trying to remove. Worse, spill ld/st
+ride the **same long-latency scoreboard** as the K/V loads, so the metric we were trying to lower
+(`long_scoreboard`) went UP 9.4×. The arithmetic is unforgiving: any scheme that processes >128
+accumulator-rows per K/V stream (the *only* way to cut the load count — head-fold into a fixed 128-row
+tile does NOT, it keeps 128 rows so the loads are identical) needs >128 rows of live `accO`, which our
+256-thread/128-row/232-reg layout cannot hold without this spill.
+
+**Rule.** On a kernel pinned at 1 CTA/SM and already at the register spill floor, "issue fewer loads
+via K/V reuse" is a **trap**: the extra accumulator state spills, and spill traffic + spill-scoreboard
+stalls cost more than the loads saved. Capturing GQA reuse requires fa2's structure — **smaller tiles
+/ fewer threads** so *k* heads' accumulators fit without spilling — i.e. a ground-up tile/thread
+redesign, not a tuning knob. Don't confuse "one CTA covers the group" (free) with "fewer K/V loads"
+(needs >128-row accumulators = more registers). Probe reverted; reproduce by re-adding the gated
+2-head inner loop. Corrects the prior entry's parenthetical hope and `[[s8-tuning-latency-bound-depth-exhausted]]`.
+
+## Deeper TMA pipelines (K `kStages`, V double-buffer) do NOT help a kernel that is latency/occupancy-bound at 1 CTA/SM — and V double-buffering REGRESSED it. More in-flight loads with no spare warps to overlap just adds memory contention
+
+**TL;DR:** On production varlen+causal+GQA shapes our kernel is **memory-latency-bound at 1 CTA/SM**
+(`long_scoreboard` ≈ 2.78 stalls/issue dominant; DRAM only ~40% so NOT bandwidth-bound; tensor < 39%
+so NOT compute-bound; L2 hit 94.6% so the GQA per-`qo_head` K/V reloads are absorbed; achieved
+occupancy 18.6% = **1 CTA/SM**, register- AND smem-locked). The textbook fix for a latency stall is
+a deeper TMA prefetch pipeline. We tried both rings; **the clock-independent metric refused both**:
+
+| experiment | `long_scoreboard` | verdict |
+|---|---|---|
+| baseline (K `kStages=2`, V depth-1) | 2.78 | — |
+| K `kStages` 2→3 (after sP-reclaim freed the smem) | 2.76 | flat — no help |
+| **V depth 1→2** (mirror the K ring) | **3.27** ↑ + DRAM↓ + SM-throughput↓ | **REGRESSED** |
+
+**Why depth can't help here.** A deeper ring hides latency only if, while a warp waits on its load,
+**other resident warps have independent work to issue**. At 1 CTA/SM with the consumer warpgroup
+register-locked (`setmaxnreg.inc<232>`, tuned to the spill floor) and smem pinning a single CTA,
+there is **no second CTA and no spare warp** to overlap into the wait. Adding a 2nd V buffer just
+puts a 2nd V TMA in flight concurrently with the 2 K TMAs → more outstanding requests contend for
+the same DRAM/L2 path → each load's *effective* latency grows → `long_scoreboard` goes **up**. The
+kernel got slower (DRAM% and SM-throughput% both dropped because wall-time rose), while staying
+**bit-exact** (s6a_ragged O max|abs|=0, torchao 12/12) — a pure perf regression, easy to misread as
+"working" if you only check correctness.
+
+**The wall-clock was useless here — trust ncu.** Home-clock wall-time for the same runs swung the
+(32,8) config **+32%** between builds (thermal/clock noise on a ~5 ms kernel); the (1,1) showed a
+spurious −7%. Only `smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio`
+(per-issue, clock-independent) gave a stable read. Profile one steady launch with
+`ncu -k regex:s3_kernel --launch-skip N --launch-count 1 --metrics ...long_scoreboard...`.
+
+**Rule.** Pipeline depth is a lever **only when occupancy leaves spare warps to overlap**. For a
+kernel already pinned at 1 CTA/SM, do NOT reach for `kStages`/double-buffering — it's a no-op at best
+and net-negative at worst. The real levers for such a kernel are (a) **raise occupancy** (more
+CTAs/warps — here blocked by registers+smem, and the 2-CTA-via-smaller-tiles route was ruled out by
+design) or (b) **issue fewer / cheaper loads** (e.g. GQA K/V reuse: one CTA serves a kv_head's whole
+qo_head group). And measure depth changes with ncu `long_scoreboard`, never the home wall-clock.
+
 ## Making a TMA load conditional means shrinking `transaction_bytes` in lockstep — the arrival barrier waits on a fixed byte count, so a load you drop without dropping its bytes DEADLOCKS (same hang class as the n_block_max mismatch)
 
 **TL;DR:** S6b's per-tensor-fp8 SFSource (`kUniformFp8`) consumes a mainstream `torch.float8_e4m3fn`
