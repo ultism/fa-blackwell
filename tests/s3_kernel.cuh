@@ -44,7 +44,8 @@ constexpr int kHeadDim = S3_HEAD_DIM, kBlockM = 128, kBlockN = 64, SFVecSize = 3
 constexpr int kSFBlockN = cute::max(int(kBlockN), 128);   // = 128
 // This is the real-64 path: the consumer slices the 128-key SF atom to the (nb&1) 64-key half
 // (subSFK / tOrSFV index / kNCol = kBlockN/4). That slicing is correct ONLY for kBlockN==64 (data
-// tile = exactly half the SF atom). kBlockN=128 is the committed kernel on `master` (no slicing).
+// tile = exactly half the SF atom). The kBlockN=128 no-slicing path was master through commit 221c24c;
+// it's preserved in git history (recover there if a selectable 128 path is ever wanted).
 static_assert(kBlockN == 64, "real-64 SF-128/data-64 half-slicing assumes kBlockN==64");
 // The block-scaled SF smem atom + TMA box are inherently 128 along the contraction
 // (cutlass Blk_SF granularity); the gmem SF layout pads K to 128 for head_dim < 128
