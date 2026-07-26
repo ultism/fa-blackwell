@@ -1,0 +1,26 @@
+==PROF== Connected to process 671096 (/root/fa-blackwell/bench/mma_peak)
+==PROF== Profiling "k_f16f16": 0%....50%....100% - 1 pass
+GPU: NVIDIA GeForce RTX 5060 Ti  SMs=36  sm_120  grid=144 blocks x 256 thr  NACC=8 ITERS=120000
+path                            TFLOP/s
+FP16 in / FP16 acc                 62.6
+FP16 in / FP32 acc                 27.0
+FP8 e4m3 / FP32 acc                50.7
+FP8 e4m3 / FP16 acc                99.5
+
+--- ratios ---
+FP16-F16acc / FP16-F32acc = 2.32x   (throttle factor on FP32 accumulate)
+FP8-F32acc  / FP16-F32acc = 1.88x   (FP8 vs bf16 attention, both FP32 acc)
+FP8-F16acc  / FP16-F32acc = 3.69x   (max if FP16 accumulate were usable)
+FP8-F16acc  / FP8-F32acc  = 1.96x   (does FP8 also escape throttle w/ f16 acc?)
+==PROF== Disconnected from process 671096
+[671096] mma_peak@127.0.0.1
+  k_f16f16(float *) (144, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: Command line profiler metrics
+    ---------------------------------------------------------------------------- ----------- ------------
+    Metric Name                                                                  Metric Unit Metric Value
+    ---------------------------------------------------------------------------- ----------- ------------
+    gpu__time_duration.sum                                                                ms        91.86
+    sm__inst_executed_pipe_tensor_subpipe_hmma.avg.pct_of_peak_sustained_elapsed           %        96.67
+    sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed                        %        96.67
+    ---------------------------------------------------------------------------- ----------- ------------
+

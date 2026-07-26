@@ -1,0 +1,15 @@
+GPU: NVIDIA GeForce RTX 5090  SMs=170  sm_120  grid=680 blocks x 256 thr  NACC=8 ITERS=120000
+path                            TFLOP/s
+FP16 in / FP16 acc                488.4
+FP16 in / FP32 acc                251.8
+FP8 e4m3 / FP32 acc               506.0
+FP8 e4m3 / FP16 acc               998.7
+MXFP8(e4m3+ue8m0)/FP32acc         992.9   <== MXFP8 block-scaled
+
+--- ratios ---
+MXFP8-blockscaled / FP16-F32acc = 3.94x   (<== REAL MXFP8 attention vs bf16 attention)
+MXFP8-blockscaled / plain-FP8-F32acc = 1.96x   (block-scaled path escapes the f32 throttle)
+FP16-F16acc / FP16-F32acc = 1.94x   (throttle factor on FP32 accumulate)
+FP8-F32acc  / FP16-F32acc = 2.01x   (FP8 vs bf16 attention, both FP32 acc)
+FP8-F16acc  / FP16-F32acc = 3.97x   (max if FP16 accumulate were usable)
+FP8-F16acc  / FP8-F32acc  = 1.97x   (does FP8 also escape throttle w/ f16 acc?)

@@ -1,0 +1,2 @@
+bf16 x bf16 -> f32 compute (cublasGemmEx):    237.1 TFLOP/s  (4.638 ms)
+fp8 e4m3 -> f32 compute (cublasLt):          796.4 TFLOP/s  (1.381 ms)

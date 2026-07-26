@@ -1,0 +1,2 @@
+name, driver_version
+NVIDIA GeForce RTX 5090, 580.95.05

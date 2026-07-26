@@ -1,0 +1,29 @@
+==PROF== Connected to process 3238 (/tmp/mma_peak)
+==PROF== Profiling "k_f16f16": 0%....50%....100% - 1 pass
+GPU: NVIDIA GeForce RTX 5090  SMs=170  sm_120  grid=680 blocks x 256 thr  NACC=8 ITERS=120000
+path                            TFLOP/s
+FP16 in / FP16 acc                486.6
+FP16 in / FP32 acc                173.7
+FP8 e4m3 / FP32 acc               347.5
+FP8 e4m3 / FP16 acc               694.8
+MXFP8(e4m3+ue8m0)/FP32acc         695.3   <== MXFP8 block-scaled
+
+--- ratios ---
+MXFP8-blockscaled / FP16-F32acc = 4.00x   (<== REAL MXFP8 attention vs bf16 attention)
+MXFP8-blockscaled / plain-FP8-F32acc = 2.00x   (block-scaled path escapes the f32 throttle)
+FP16-F16acc / FP16-F32acc = 2.80x   (throttle factor on FP32 accumulate)
+FP8-F32acc  / FP16-F32acc = 2.00x   (FP8 vs bf16 attention, both FP32 acc)
+FP8-F16acc  / FP16-F32acc = 4.00x   (max if FP16 accumulate were usable)
+FP8-F16acc  / FP8-F32acc  = 2.00x   (does FP8 also escape throttle w/ f16 acc?)
+==PROF== Disconnected from process 3238
+[3238] mma_peak@127.0.0.1
+  k_f16f16(float *) (680, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: Command line profiler metrics
+    ---------------------------------------------------------------------------- ----------- ------------
+    Metric Name                                                                  Metric Unit Metric Value
+    ---------------------------------------------------------------------------- ----------- ------------
+    gpu__time_duration.sum                                                                ms        61.63
+    sm__inst_executed_pipe_tensor_subpipe_hmma.avg.pct_of_peak_sustained_elapsed           %        99.59
+    sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed                        %        99.59
+    ---------------------------------------------------------------------------- ----------- ------------
+
