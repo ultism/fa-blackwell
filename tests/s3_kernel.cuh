@@ -454,7 +454,7 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
     // real-64: the SF stays 128-key resident (atom-aligned), the DATA is 64. Slice the QK-B SF
     // register fragment (mode-1 = (4,4)) to the 64-key half h = nb&1: split the inner 4 into (2,2),
     // fix the trailing coord to h, regroup -> (4,2)=8 keys matching the 64-key data operand.
-    auto subSFK = [](auto const& f, int h) {
+    auto subSFK = [](auto const& f, auto h) {   // h: cute::Int<half> -> STATIC slice offset (S9: no local demotion)
       auto m1 = get<1>(f.layout()); auto a = get<0>(m1); auto b = get<1>(m1);
       auto nb = shape(b); auto sb = stride(b);
       auto t = make_tensor(f.data(), make_layout(get<0>(f.layout()),
@@ -517,7 +517,21 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
           for (int i = 0; i < size(tSrSFQ); ++i) tSrSFQ(i) = ElementSF::bitcast(kUniformSFByte);
         pipeline_q.consumer_release(rq); ++rq; }
 
-      for (int nb = 0; nb < n_block_max; ++nb) {
+      // S9: drive the n_block loop in even/odd PAIRS so the SF half h = nb&1 is a
+      // COMPILE-TIME constant (cute::Int<0/1>). The runtime (nb&1) indexing demoted the
+      // SF register fragments to a 160B stack frame (SASS: 64x LDL.U8 + 32x STL.U8 per
+      // n_block; ncu: local = ~90% of L1TEX sectors at 0.3B/sector, LSU the #1 issue
+      // pipe). Static h keeps the SF bytes in registers -- identical selection values,
+      // bit-exact same math. step() is instantiated once per half (Int<0>/Int<1>).
+      Tensor accS = partition_fragment_C(mma_qk, select<0, 1>(TileShape_MNK{}));   // ((2,2),1,8) at kBlockN=64
+      // reduction view: ((row=2,MMA_M=1),(col=2,MMA_N)) = 2 rows x kBlockN/2 cols.
+      Tensor accS_rc = make_tensor(accS.data(), make_layout(
+          make_layout(get<0, 1>(accS.layout()), get<1>(accS.layout())),
+          make_layout(get<0, 0>(accS.layout()), get<2>(accS.layout()))));
+      constexpr int kNRow = 2, kNCol = kBlockN / 4;
+
+      auto step = [&](int nb, auto hc) {
+        constexpr int h = decltype(hc)::value;
         // ---- QK ----
         { auto t = pipeline_k.consumer_try_wait(rk); pipeline_k.consumer_wait(rk, t);
           int stage = rk.index();
@@ -527,36 +541,36 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
           else
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < size(tSrSFK); ++i) tSrSFK(i) = ElementSF::bitcast(kUniformSFByte); }
-        Tensor accS = partition_fragment_C(mma_qk, select<0, 1>(TileShape_MNK{}));   // ((2,2),1,16)
         clear(accS);
-        auto tSrSFK_h = subSFK(tSrSFK, nb & 1);   // 64-key SF half for this data block
+        auto tSrSFK_h = subSFK(tSrSFK, hc);   // 64-key SF half for this data block (static h)
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < size<2>(tSrQ); ++k)
           cute::gemm(mma_qk, make_zip_tensor(tSrQ(_, _, k), tSrSFQ(_, _, k)),
                      make_zip_tensor(tSrK(_, _, k), tSrSFK_h(_, _, k)), accS);
         pipeline_k.consumer_release(rk); ++rk;
 
-        // reduction view: ((row=2,MMA_M=1),(col=2,MMA_N=16)) = 2 rows x 32 cols.
-        Tensor accS_rc = make_tensor(accS.data(), make_layout(
-            make_layout(get<0, 1>(accS.layout()), get<1>(accS.layout())),
-            make_layout(get<0, 0>(accS.layout()), get<2>(accS.layout()))));
-        constexpr int kNRow = 2, kNCol = kBlockN / 4;
-
         // request-local masking. Causal diagonal is shifted by offset_q = kv_len - qo_len
         // (slice-3): query m attends keys [0, m + offset_q]. qo_len==kv_len -> offset_q=0 ->
         // diagonal at local 0 (slice-1/2). partial_n drops padded keys past kv_len in the last
         // tile (non-causal needs this; causal already excludes them via the shifted diagonal).
         // Dense non-causal full tile: both conditions false -> whole block elided (bit-exact).
+        // S9c: skip FULLY-UNMASKED blocks outright (the causal-varlen common case -- every
+        // block below the diagonal): the whole elementwise pass reduces to one bound check.
+        // The mask is per-thread on this thread's own accS elements, so full_n diverging
+        // within a warp is fine. Same masks produced, bit-exact.
         bool const partial_n = ((nb + 1) * kBlockN > kv_len);
-        if (Causal || partial_n) {
+        int const m_base = q_tile_local * kBlockM + warp * 16 + (lane / 4);   // this thread's lowest row
+        bool const full_n = !partial_n && (!Causal || (nb + 1) * kBlockN <= m_base + offset_q + 1);
+        if (!full_n) {
+          int const col_base = (lane % 4) * 2;              // col(ni) = (ni/2)*8 + col_base + (ni%2)
+          int const kmax = kv_len - nb * kBlockN;           // mask col >= kmax (padded keys)
           CUTLASS_PRAGMA_UNROLL
           for (int mi = 0; mi < kNRow; ++mi) {
-            int m_local = q_tile_local * kBlockM + warp * 16 + (lane / 4) + mi * 8;
+            int const thr = m_base + mi * 8 + offset_q - nb * kBlockN;   // causal: mask col > thr
             CUTLASS_PRAGMA_UNROLL
             for (int ni = 0; ni < kNCol; ++ni) {
-              int col = (ni / 2) * 8 + (lane % 4) * 2 + (ni % 2);
-              int n_local = nb * kBlockN + col;
-              if ((Causal && n_local > m_local + offset_q) || n_local >= kv_len) accS_rc(mi, ni) = -INFINITY;
+              int col = (ni / 2) * 8 + col_base + (ni % 2);
+              if ((Causal && col > thr) || col >= kmax) accS_rc(mi, ni) = -INFINITY;
             }
           }
         }
@@ -726,7 +740,10 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             copy(scSFV, tscSFV.partition_S(as_position_independent_swizzle_tensor(sSFV)), tscSFV.retile_D(tOrSFV));
           else
             CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < size(tOrSFV); ++i) tOrSFV(i) = ElementSF::bitcast(kUniformSFByte); }
+            for (int i = 0; i < size(tOrSFV); ++i) tOrSFV(i) = ElementSF::bitcast(kUniformSFByte);
+          // the ldmatrix drained sV/sSFV into registers -> release EARLY so the producer's
+          // V(nb+1) TMA overlaps the rescale/PV work below (the gemm reads registers, not smem).
+          pipeline_v.consumer_release(rv); ++rv; }
 #if S3_V_KFILLZERO
         // Fully-masked 32-key tiles (all keys >= kv_len) may carry a garbage NaN SF (ue8m0 0xFF);
         // replace with a finite byte. Their DATA was zeroed above. The straddling tile keeps its
@@ -736,24 +753,21 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
           CUTLASS_PRAGMA_UNROLL
           for (int k = 0; k < NKB; ++k)
             if (k * SFVecSize >= valid) {
-              Tensor sfk = tOrSFV(_, _, (nb & 1) * NKB + k);   // V-SF k-blocks for this 64-key half
+              Tensor sfk = tOrSFV(_, _, h * NKB + k);   // V-SF k-blocks for this 64-key half
               CUTLASS_PRAGMA_UNROLL
               for (int i = 0; i < size(sfk); ++i) sfk(i) = ElementSF::bitcast(uint8_t(0));
             }
         }
 #endif
 
-        // ---- PV into a FRESH block accumulator, then telescope onto the running accO ----
-        // accO = accO*scores_scale + accB (accO is never itself a gemm target). accB native
-        // ((2,2),1,MMA_N): coord ((a,b),0,c) with b = get<0,1> = M-row (scores_scale is per
-        // M-row), a = N column-pair.
-        Tensor accB = partition_fragment_C(mma_pv, select<0, 2>(TileShape_MNK{}));
-        clear(accB);
-        CUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < size<2>(tOrP); ++k)
-          cute::gemm(mma_pv, make_zip_tensor(tOrP(_, _, k), tOrSFP(_, _, k)),
-                     make_zip_tensor(tOrV(_, _, k), tOrSFV(_, _, (nb & 1) * NKB + k)), accB);   // V-SF half
-        pipeline_v.consumer_release(rv); ++rv;   // release V AFTER the gemm has consumed it
+        // ---- rescale accO in registers, then PV accumulates DIRECTLY onto it ----
+        // accO = accO*scores_scale (64 FMUL); accO += P*V (gemm C=D=accO). This replaces
+        // the accB block accumulator + telescope and frees 64 registers (s9e) -- headroom
+        // that lets the S9d V-load hoist stay spill-free, and lets ptxas overlap the
+        // independent QK/PV QMMAs across the softmax ALU chain. accO native ((a,b),0,c):
+        // b = get<0,1> = M-row (scores_scale is per M-row), a = N column-pair.
+        // NOTE: NOT bit-exact vs the old accB+telescope add order (~1e-7 rel, well inside
+        // the fp64-oracle tolerance).
         CUTLASS_PRAGMA_UNROLL
         for (int a = 0; a < 2; ++a) {
           CUTLASS_PRAGMA_UNROLL
@@ -761,10 +775,18 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             CUTLASS_PRAGMA_UNROLL
             for (int c = 0; c < size<2>(accO); ++c) {
               auto coord = make_coord(make_coord(a, b), _0{}, c);
-              accO(coord) = accO(coord) * scores_scale[b] + accB(coord);
+              accO(coord) = accO(coord) * scores_scale[b];
             }
           }
         }
+        CUTLASS_PRAGMA_UNROLL
+        for (int k = 0; k < size<2>(tOrP); ++k)
+          cute::gemm(mma_pv, make_zip_tensor(tOrP(_, _, k), tOrSFP(_, _, k)),
+                     make_zip_tensor(tOrV(_, _, k), tOrSFV(_, _, h * NKB + k)), accO);   // V-SF half
+      };
+      for (int nb = 0; nb < n_block_max; nb += 2) {
+        step(nb, cute::Int<0>{});                              // even block: SF half 0
+        if (nb + 1 < n_block_max) step(nb + 1, cute::Int<1>{});  // odd block: SF half 1
       }
 
       // ---- epilogue: finalize row_sum, normalize O, write LSE ----
@@ -778,7 +800,11 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         for (int ni = 0; ni < size<1>(accO_rc); ++ni) accO_rc(mi, ni) *= inv;
       }
       Tensor gO = local_tile(mO, select<0, 2>(TileShape_MNK{}), make_coord(q_tile_global, _0{}));
-      copy(accO, thr_pv.partition_C(gO));
+      // S9d: the C fragment's mode-0 is a stride-1 column PAIR (8B, provably aligned: col
+      // pairs are even, rows are 512B apart) -- but plain cute::copy assumes 128b alignment
+      // and falls back to scalar STG.E (SASS: 16.1/32B per sector). Force 64b vectorization
+      // -> STG.E.64, halving epilogue store instructions and L2 write sectors.
+      copy(AutoVectorizingCopyWithAssumedAlignment<64>{}, accO, thr_pv.partition_C(gO));
       CUTLASS_PRAGMA_UNROLL
       for (int mi = 0; mi < 2; ++mi) {
         int q_local = q_tile_local * kBlockM + warp * 16 + (lane / 4) + mi * 8;

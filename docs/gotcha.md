@@ -5,6 +5,45 @@ first. Each entry: what bit us, the measured evidence, and the actionable rule.
 
 ---
 
+## On sm120 `setmaxnreg` compiles to `USETMAXREG` (NOT `SETMAXNREG` — grep right) — the WS register realloc DOES work: producer R≤24, consumer R≤232. The spill wall is 232, not 168.
+
+> **STATUS (2026-07-21): VERIFIED, correcting an earlier false alarm.** First pass grepped
+> SASS for `SETMAXNREG`, found zero, and concluded "ptxas drops setmaxnreg on sm120" — WRONG:
+> the sm120 SASS mnemonic is **`USETMAXREG`** (uniform datapath, no "N"), so the grep false-
+> negatives. What actually happens (s3_kernel + minimal repro alike): PTX `setmaxnreg.dec 24`
+> → `USETMAXREG.DEALLOC.CTAPOOL 0x18`; PTX `setmaxnreg.inc 232` → `USETMAXREG.TRY_ALLOC
+> .CTAPOOL UP0, 0xe8` + a `BRA.U !UP0` retry loop (consumer spins until the CTA pool has the
+> regs freed by the producer's dealloc). ptxas does PER-REGION allocation around the barrier:
+> splitting the SASS at the two USETMAXREGs, the producer region tops out at **R20** (≤24) and
+> the consumer at **R229** (≤232). `cuobjdump -res-usage`'s `REG:168` is only the LAUNCH-static
+> per-thread count (65536/384 rounded down) — not the consumer's budget. **Consequence: the
+> mainloop register wall is ~232, not 168.** The S9 pipeline experiments spilled against 232:
+> full QK rotation with the accB form needs accO(64)+accB(64)+accS(32)+operands ≈ 220–240 →
+> STACK 200B, net regression; the V-load hoist (tOrV live across the softmax) tipped past the
+> margin too (STACK 232B). The accB fold (direct `accO += P*V`, −64 regs) funded the winning
+> s9e/s9f shape. Live-range budget against **232** (and check `STACK` + region-split max-reg
+> scans, never `-res-usage` alone) before ILP surgery on this kernel.
+
+---
+
+## The real-64 `(nb&1)` SF half-slice DEMOTES the SF fragments to a 160B stack frame — 1.5GB of byte-granular local traffic that the ncu "spill" wording hides. Fix: drive the n_block loop in even/odd PAIRS with `cute::Int<0/1>`.
+
+> **STATUS (2026-07-21): FIXED (S9a, ~1.14–1.17× all configs).** `subSFK(tSrSFK, nb&1)` and
+> `tOrSFV(_, _, (nb&1)*NKB + k)` index register fragments by a RUNTIME value → ptxas demotes
+> them to local: `STACK:160`, SASS = 64× `LDL.U8` + 32× `STL.U8` per n_block (each QMMA's SF
+> byte reloaded from stack), ncu local = 90% of L1TEX sectors at **0.3B/sector**, LSU the #1
+> issue pipe (45.7% > tensor 42.1%). ptxas's "20B spill" counts only true spills — dynamic-
+> indexed arrays live in the **stack frame**, not the spill count. The audit saw the traffic
+> but called it "fire-and-forget, non-binding": wrong on the ISSUE axis (local reloads do hit
+> L1 at 99%, but every LDL/STL.U8 steals an issue slot from QMMA/FFMA at 2 warps/scheduler).
+> Fix: `for (nb; nb += 2) { step(nb, Int<0>); if (…) step(nb+1, Int<1>); }` with the half a
+> `cute::Int<>` template constant → STACK 160→72B→48B, `LDL.U8/STL.U8` = 0, local sectors
+> −98.4%, L2 SOL 76%→25%, LSU 45.7%→30.9%, tensor 42→51%. Same selection values, bit-exact.
+> Rule: **NEVER index a CuTe register fragment by a runtime n_block parity** — make the parity
+> a type-level constant by unrolling the loop 2× (or templating the body).
+
+---
+
 ## The SF 128-granularity that blocks `kBlockN=64` is the sm100 **TMEM** staging format, REUSED on sm120 by inheritance — NOT an sm120 hardware requirement. The sm120 warp QMMA wants literally **1 scale byte per thread** (`SFARegisters = uint8_t[1]`); the interleaved 128-atom means nothing to it.
 
 > **STATUS (2026-06-24): DONE + VALIDATED + COMMITTED** to branch `experiment/s8-real-n64` (commit

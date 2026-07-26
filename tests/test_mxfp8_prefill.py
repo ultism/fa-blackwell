@@ -156,15 +156,18 @@ def test_attn_matches_torchao(causal, head_dim):
     accO_true = torch.zeros_like(accO)                                        # no P requant (absolute accuracy)
     row_sum = torch.zeros(Sq, dtype=torch.float64, device="cuda")
     m_run = torch.full((Sq,), NINF, dtype=torch.float64, device="cuda")
-    for nb in range(Sk // 128):
-        sblk = S[:, nb * 128:(nb + 1) * 128]
+    # real-64 (kBlockN=64): the online replay MUST step at the kernel's 64-key block
+    # granularity -- a 128-key replay uses a different running-max/binade timing and
+    # disagrees ~0.3-0.4% (P-quant granularity, NOT a kernel bug). See docs/gotcha.md.
+    for nb in range(Sk // 64):
+        sblk = S[:, nb * 64:(nb + 1) * 64]
         m_prev = m_run
         m_cur = torch.maximum(m_prev, sblk.max(dim=1).values)
         ss = torch.where(m_prev == NINF, torch.zeros_like(m_prev), torch.exp((m_prev - m_cur) * sm_scale))
         p = torch.exp((sblk - m_cur[:, None]) * sm_scale)
         p = torch.where(m_cur[:, None] == NINF, torch.zeros_like(p), torch.nan_to_num(p, nan=0.0))
         row_sum = row_sum * ss + p.sum(dim=1)
-        Vblk = Vdq[:, nb * 128:(nb + 1) * 128].t()
+        Vblk = Vdq[:, nb * 64:(nb + 1) * 64].t()
         # kernel: FIXED scalar scale 256.0 (se=-8). P<=1.0 post-max-subtraction so it never
         # saturates (1.0*256=256<=448); e4m3 RNE rounding, dequant /256.
         Pdq = (p.float() * 256.0).to(torch.float8_e4m3fn).double() / 256.0
@@ -242,14 +245,14 @@ def test_attn_partial_kvlen_matches_torchao(head_dim=128):
     accO = torch.zeros(Sq, head_dim, dtype=torch.float64, device="cuda")
     row_sum = torch.zeros(Sq, dtype=torch.float64, device="cuda")
     m_run = torch.full((Sq,), NINF, dtype=torch.float64, device="cuda")
-    for nb in range(Sk_pad // 128):
-        sblk = S[:, nb * 128:(nb + 1) * 128]
+    for nb in range(Sk_pad // 64):   # 64-key replay: match kernel kBlockN (see stage-1e note)
+        sblk = S[:, nb * 64:(nb + 1) * 64]
         m_cur = torch.maximum(m_run, sblk.max(dim=1).values)
         ss = torch.where(m_run == NINF, torch.zeros_like(m_run), torch.exp((m_run - m_cur) * sm_scale))
         p = torch.exp((sblk - m_cur[:, None]) * sm_scale)
         p = torch.where(m_cur[:, None] == NINF, torch.zeros_like(p), torch.nan_to_num(p, nan=0.0))
         row_sum = row_sum * ss + p.sum(dim=1)
-        Vblk = Vdq[:, nb * 128:(nb + 1) * 128].t()
+        Vblk = Vdq[:, nb * 64:(nb + 1) * 64].t()
         Pdq = (p.float() * 256.0).to(torch.float8_e4m3fn).double() / 256.0   # kernel's fixed scale 256
         accO = accO * ss[:, None] + Pdq @ Vblk
         m_run = m_cur
@@ -308,14 +311,14 @@ def test_attn_causal_offset_matches_torchao(qo_len, kv_len, Sk_pad, head_dim=128
     accO = torch.zeros(qo_len, head_dim, dtype=torch.float64, device="cuda")
     row_sum = torch.zeros(qo_len, dtype=torch.float64, device="cuda")
     m_run = torch.full((qo_len,), NINF, dtype=torch.float64, device="cuda")
-    for nb in range(Sk_pad // 128):
-        sblk = S[:, nb * 128:(nb + 1) * 128]
+    for nb in range(Sk_pad // 64):   # 64-key replay: match kernel kBlockN (see stage-1e note)
+        sblk = S[:, nb * 64:(nb + 1) * 64]
         m_cur = torch.maximum(m_run, sblk.max(dim=1).values)
         ss = torch.where(m_run == NINF, torch.zeros_like(m_run), torch.exp((m_run - m_cur) * sm_scale))
         p = torch.exp((sblk - m_cur[:, None]) * sm_scale)
         p = torch.where(m_cur[:, None] == NINF, torch.zeros_like(p), torch.nan_to_num(p, nan=0.0))
         row_sum = row_sum * ss + p.sum(dim=1)
-        Vblk = Vdq[:, nb * 128:(nb + 1) * 128].t()
+        Vblk = Vdq[:, nb * 64:(nb + 1) * 64].t()
         Pdq = (p.float() * 256.0).to(torch.float8_e4m3fn).double() / 256.0   # kernel's fixed scale 256
         accO = accO * ss[:, None] + Pdq @ Vblk
         m_run = m_cur
@@ -383,14 +386,14 @@ def test_attn_per_tensor_fp8_matches_torchao(causal, Sq, kv_len, Sk_pad, head_di
     accO = torch.zeros(Sq, head_dim, dtype=torch.float64, device="cuda")
     row_sum = torch.zeros(Sq, dtype=torch.float64, device="cuda")
     m_run = torch.full((Sq,), NINF, dtype=torch.float64, device="cuda")
-    for nb in range(Sk_pad // 128):
-        sblk = S[:, nb * 128:(nb + 1) * 128]
+    for nb in range(Sk_pad // 64):   # 64-key replay: match kernel kBlockN (see stage-1e note)
+        sblk = S[:, nb * 64:(nb + 1) * 64]
         m_cur = torch.maximum(m_run, sblk.max(dim=1).values)
         ss = torch.where(m_run == NINF, torch.zeros_like(m_run), torch.exp((m_run - m_cur) * sm_scale))
         p = torch.exp((sblk - m_cur[:, None]) * sm_scale)
         p = torch.where(m_cur[:, None] == NINF, torch.zeros_like(p), torch.nan_to_num(p, nan=0.0))
         row_sum = row_sum * ss + p.sum(dim=1)
-        Vblk = Vdq[:, nb * 128:(nb + 1) * 128].t()
+        Vblk = Vdq[:, nb * 64:(nb + 1) * 64].t()
         Pdq = (p.float() * 256.0).to(torch.float8_e4m3fn).double() / 256.0
         accO = accO * ss[:, None] + Pdq @ Vblk
         m_run = m_cur

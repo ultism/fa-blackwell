@@ -193,3 +193,42 @@ platform ceiling that the SOTA reference (Sage) hits even harder.** We still bea
 math is cheap enough that even with `wait` exposed we finish well ahead of fa2's saturated bf16 pipe.
 
 *See also:* `docs/gotcha.md` (SF-128 = TMEM artifact / no TMEM on sm120; the spill diagnosis arc).
+
+---
+
+## Addendum (2026-07-21, S9) — two claims in this audit were wrong; the "ISA wall" is ~23% softer than concluded
+
+Re-examination of the same `real64_8x2_causal.ncu-rep` + SASS disassembly produced two
+corrections, and fixing them made the kernel **1.21–1.25× faster** (bench_ragged min-of-N,
+all configs; ncu single-launch 0.770→0.625 ms; vs fa2 now ~2.8×):
+
+1. **"Spill write-through is fire-and-forget, non-binding" — wrong on the issue axis.** The
+   1.5GB local traffic was NOT ptxas spill (20B); it was the real-64 `nb&1` SF half-slice
+   demoting the SF register fragments to a 160B stack frame (64× LDL.U8 + 32× STL.U8 per
+   n_block). The reloads do hit L1 (latency fine), but ~96 byte-granular local instructions
+   per thread per block steal issue slots at 2 warps/scheduler — LSU was the #1 pipe (45.7%
+   > tensor 42.1%). Fix (even/odd unroll, `cute::Int<h>`): local sectors −98%, LSU 30.9%.
+2. **"WS register realloc delivered" — CORRECT after all, but the wall is subtler.** On
+   sm120, `setmaxnreg` compiles to `USETMAXREG` (not `SETMAXNREG` — an early grep for the
+   latter false-negatived and briefly produced the opposite, wrong claim). ptxas allocates
+   per-region: producer ≤24 (R20 observed), consumer ≤232 (R229 observed);
+   `res-usage REG:168` is only the launch-static count. So the consumer really runs at 232 —
+   and full QK-rotation pipelining STILL spilled (accO+accB+accS+operands ≈ 220–240 > 232;
+   STACK 200–296B, net regression). The productive use of the budget was the accB fold
+   (direct `accO += P*V`, −64 regs) + cheap hoists, not rotation.
+
+What S9 actually shipped (all validated by the torchao oracle, O ≤ 9e-5, 12/12):
+- **S9a** even/odd static SF halves (above): ~1.14–1.17×.
+- **S9e** accB fold + early V release (smem drained at ldmatrix, not after gemm): +1–2%,
+  STACK 48B. Not bit-exact vs the accB+telescope add order (~1e-7, inside oracle tol).
+- **S9f** causal full-block mask skip (one bound check vs 32 FSETP/FSEL per full block) +
+  O-write float2 vectorization (`AutoVectorizingCopyWithAssumedAlignment<64>`, was scalar
+  STG.E at 16.1/32B per sector): +4–5%.
+
+Post-S9 profile (ncu, same launch): tensor 42.1→**50.9%**, L2 SOL 76→**25%**, wait
+1.26→1.30 (per-issue ratio flat because instruction count fell 8%; absolute wait-cycles
+dropped), issue 39.7→~46%. The residual `wait` ~1.3 at tensor ~51% with 0.65 eligible
+warps IS the synchronous-mma.sync floor this audit describes — but ~23% of kernel time was
+software-removable on top of it. Also fixed: the in-repo torchao oracle replayed the online
+algo at 128-key blocks (stale since real-64; false-failed ~0.3%) — now replays at 64-key
+(`tests/test_mxfp8_prefill.py`), agreeing with the kernel at ~5e-6 as the gotcha predicted.

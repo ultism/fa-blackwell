@@ -201,12 +201,22 @@ static float bench_ours(const std::vector<int>& lens, int num_qo_heads, int num_
 
 int main() {
   // production-like varlen prefill batch (qo_len == kv_len), mixed lengths incl non-128-multiples.
+  // env overrides (5090 evidence runs): S3_LENS="512,1024,..." S3_QH=8 S3_KH=2 (single cfg)
   std::vector<int> lens = {512,1024,768,1536,2048,640,1280,896,384,1792,512,2560,1024,768,2048,1100};
+  if (const char* e = std::getenv("S3_LENS")) {
+    lens.clear();
+    std::string s(e); size_t p = 0;
+    while (p <= s.size()) { size_t c = s.find(',', p); lens.push_back(std::stoi(s.substr(p, c - p))); if (c == std::string::npos) break; p = c + 1; }
+  }
   int total = 0, mn = 1<<30, mx = 0; for (int L : lens) { total += L; mn = std::min(mn,L); mx = std::max(mx,L); }
   printf("LENS"); for (int L : lens) printf(" %d", L); printf("\n");
   printf("# batch B=%d  total_tokens=%d  min=%d max=%d  head_dim=%d  SMs=%d\n",
          (int)lens.size(), total, mn, mx, int(kHeadDim), query_num_sm());
   std::vector<std::pair<int,int>> cfgs = {{1,1},{8,2},{32,8}};
+  if (const char* e = std::getenv("S3_QH")) {
+    int kh = std::getenv("S3_KH") ? std::atoi(std::getenv("S3_KH")) : 1;
+    cfgs = {{std::atoi(e), kh}};
+  }
   printf("\n%-12s %-8s | %12s\n", "cfg(qh,kh)", "causal", "ours ms");
   printf("--------------------------------------------\n");
   for (auto [qh,kh] : cfgs)
