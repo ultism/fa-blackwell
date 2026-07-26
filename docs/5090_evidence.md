@@ -32,10 +32,16 @@
    tensor pipe 占用 47–55%——离块缩放上界（~993 TFLOP/s @GB202）还有近一倍余量。
 3. 加速比随 batch/并行度收敛（2.74×→2.06×）：大 batch 下 fa2 填满 SM 后只能靠
    指令速率差（~4× 上限比 × 双方利用率比 ~50%/85% ≈ 2.2×）。
-4. **注意（metric 语义）**：`sm__pipe_tensor_cycles_active` 对 HMMA.F32 在 GB206 与
-   GB202 上语义不同（GB206 每指令占用 2 周期 → fa2 占用 87%；GB202 为发射配给
-   → fa2 占用 43%，两者都对应其通路上限的 ~85%）。跨 die 比较 pipe% 需同指标
-   同 die；本表 pipe% 仅作同机双侧对比。
+4. **注意（metric 语义，已用 ncu + mma_peak 双向验证）**：FP32-acc 节流在两个 die 上
+   机制不同。纯寄存器 MMA 满速循环的 `sm__pipe_tensor_cycles_active` / `issue`：
+   - GB206（5060 Ti）：HMMA.F32 = **96.5% / 48.2%（占用 : 发射 ≈ 2:1）**——数据通路
+     减半，每条指令在 pipe 里占 2 拍；HMMA.F16 = 97.3/97.3。
+   - GB202（5090）：HMMA.F32 = **49.8% / 49.8%（1:1）**——发射配给，指令 1 拍走完但
+     隔拍才放行；HMMA.F16 与 QMMA.SF = 99.6/99.6。
+   - 两 die 净效果相同（F32-acc 吞吐减半），QMMA.SF 块缩放在两 die 均全速。
+   因此 `pipe_tensor_cycles_active` 对 HMMA.F32 跨 die 不可直接比（fa2 在 GB206 显示
+   ~87%、GB202 显示 ~43%，对应的是同一相对水平 ~85% roof）；同 die 双侧对比有效。
+   我们的 QMMA.SF 路径该指标跨 die 可直接比（两机均 ~50%）。
 
 ## 原始数据
 
