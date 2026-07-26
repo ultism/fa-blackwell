@@ -26,8 +26,8 @@
 | binding（新） | `csrc/mxfp8_attention_sm120/mxfp8_attention_sm120_binding.cu`（TVM-FFI，无 torch 头） |
 | JIT（新） | `flashinfer/jit/mxfp8_attention_sm120.py` |
 | Python API（新） | `flashinfer/mxfp8_attention_sm120.py`（`mxfp8_attention_sm120_fwd`） |
-| trace（新） | `flashinfer/trace/templates/mxfp8_attention_sm120.py`、`tests/trace/fi_trace_out/mxfp8_attention_sm120_fwd_head_dim128.json` |
-| 测试（新） | `tests/attention/test_mxfp8_attention_sm120.py`（5 例）、`benchmarks/bench_mxfp8_attention_sm120.py` |
+| trace（新） | `flashinfer/trace/templates/mxfp8_attention_sm120.py`、`tests/trace/fi_trace_out/mxfp8_attention_sm120_{fwd,run}_head_dim128.json` |
+| 测试（新） | `tests/attention/test_mxfp8_attention_sm120.py`（7 例）、`benchmarks/bench_mxfp8_attention_sm120.py` |
 | 注册（改） | `flashinfer/__init__.py`、`flashinfer/aot.py`、`flashinfer/jit/__init__.py`、`tests/trace/example.py`、`docs/api/attention.rst` |
 
 ## Commit message（feature commit）
@@ -83,12 +83,12 @@ The block-scaled MXFP8 MMA is the only way to get full-rate tensor throughput *w
 
 - **Kernel** (`include/flashinfer/attention/sm120/mxfp8_attention_sm120/`): warp-specialized producer/consumer prefill kernel, TMA-fed, persistent with a host-built LPT (longest-processing-time) tile work-list (`BatchPrefillPersistentTileScheduler`). Framework-agnostic headers, raw pointers.
 - **Contract** (`mxfp8_attention_sm120_fwd`): ragged varlen FP8 (`float8_e4m3fn`) Q/K/V `[total_tokens, heads, 128]`, per-tensor scales (`q_scale·k_scale` fold into `sm_scale` on the host, `v_scale` into the PV output in-kernel — the kernel's `kUniformFp8` mode), GQA (`num_qo_heads % num_kv_heads == 0`), and FlashInfer slice-3 causal semantics (query `m` attends keys `[0, m + kv_len - qo_len]`), which covers prefix-cache hits and chunked-prefill continuation natively. Returns `(out [total_q, Hq, 128] fp16/bf16, lse [total_q, Hq] fp32)`.
-- **Plumbing** mirroring `nvfp4_attention_sm120`: TVM-FFI binding (`csrc/mxfp8_attention_sm120/`), JIT module with `sm120a_nvcc_flags`, AOT registration, trace template + `fi_trace_out` example + `tests/trace/example.py` entry, API docs, and a standalone microbenchmark (`benchmarks/bench_mxfp8_attention_sm120.py`).
-- The Python API currently does the per-request 128-row padding and the LPT work-list build on the host (documented in the docstring).
+- **Plumbing** mirroring `nvfp4_attention_sm120`: TVM-FFI binding (`csrc/mxfp8_attention_sm120/`), JIT module with `sm120a_nvcc_flags`, AOT registration, trace templates + `fi_trace_out` examples + `tests/trace/example.py` entry, API docs, and a standalone microbenchmark (`benchmarks/bench_mxfp8_attention_sm120.py`).
+- **Plan/run split** (`MXFP8AttentionSM120Wrapper`): `plan()` performs the batch-composition host work once per step (128-row padding layout, persistent LPT work lists) and `run()` is tensors-only per layer — matching the calling convention of the other FlashInfer prefill wrappers, so per-layer calls do not repeat host work. Scales/`sm_scale` are run-time (per-layer quantization); `causal` is plan-time (scheduler cost model). `mxfp8_attention_sm120_fwd` remains as a one-shot plan+run convenience.
 
 ### Testing
 
-- `tests/attention/test_mxfp8_attention_sm120.py` (SM120/SM121-gated): ragged GQA causal (bf16/fp16 out), ragged MHA non-causal, single long request (2048), and prefix-append (`kv_len > qo_len`) cases. The reference replays the kernel's exact numerics — unnormalized P requantized to e4m3 at a fixed scale of 256, normalized by the unquantized row sum — so the gates are tight against masking/stride/GQA indexing bugs while tolerating only accumulation-order noise. **5/5 passing on RTX 5060 Ti (SM120).**
+- `tests/attention/test_mxfp8_attention_sm120.py` (SM120/SM121-gated): ragged GQA causal (bf16/fp16 out), ragged MHA non-causal, single long request (2048), prefix-append (`kv_len > qo_len`), wrapper plan-reuse (one plan, multiple runs), and the one-shot functional path. The reference replays the kernel's exact numerics — unnormalized P requantized to e4m3 at a fixed scale of 256, normalized by the unquantized row sum — so the gates are tight against masking/stride/GQA indexing bugs while tolerating only accumulation-order noise. **7/7 passing on RTX 5060 Ti (SM120).**
 - Trace-template consistency tests pass (auto-discovered).
 - ruff + clang-format (19.1.1) clean.
 - Before upstreaming, the same kernel was validated end-to-end in vLLM 0.21 (Qwen3-8B-AWQ, fp8 KV cache, `enable_prefix_caching=True`, chunked prefill): long-context outputs matched the stock bf16-prefill backend token-for-token.
@@ -112,7 +112,7 @@ Note: these are kernel-level numbers for the attention itself; the op-level Pyth
 
 - `BatchPrefillWithRaggedKVCacheWrapper` dispatch integration (this PR is the standalone op only).
 - Drop the internal V transpose by moving to an HD-major V smem atom (the current Sk-major atom requires Sk-contiguous gmem; documented in the binding).
-- Move padding/LPT work-list construction off the Python hot path (plan/run split).
+- Move the plan-time host work (padding layout + LPT lists) on-device to remove the D2H sync.
 - Split-KV scheduling for single-long-prompt batches, RTX 5090 benchmarks, and vLLM e2e wiring.
 
 AI-assisted development (kernel authored and validated in an external worktree with ncu-guided optimization before upstreaming).

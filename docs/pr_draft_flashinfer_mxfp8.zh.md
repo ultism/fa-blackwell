@@ -27,8 +27,8 @@
 | binding（新增） | `csrc/mxfp8_attention_sm120/mxfp8_attention_sm120_binding.cu`（TVM-FFI，不含 torch 头） |
 | JIT 模块（新增） | `flashinfer/jit/mxfp8_attention_sm120.py` |
 | Python API（新增） | `flashinfer/mxfp8_attention_sm120.py`（`mxfp8_attention_sm120_fwd`） |
-| trace（新增） | `flashinfer/trace/templates/mxfp8_attention_sm120.py`、`tests/trace/fi_trace_out/mxfp8_attention_sm120_fwd_head_dim128.json` |
-| 测试/benchmark（新增） | `tests/attention/test_mxfp8_attention_sm120.py`（5 例）、`benchmarks/bench_mxfp8_attention_sm120.py` |
+| trace（新增） | `flashinfer/trace/templates/mxfp8_attention_sm120.py`、`tests/trace/fi_trace_out/mxfp8_attention_sm120_{fwd,run}_head_dim128.json` |
+| 测试/benchmark（新增） | `tests/attention/test_mxfp8_attention_sm120.py`（7 例）、`benchmarks/bench_mxfp8_attention_sm120.py` |
 | 注册（修改） | `flashinfer/__init__.py`、`flashinfer/aot.py`、`flashinfer/jit/__init__.py`、`tests/trace/example.py`、`docs/api/attention.rst` |
 
 ## Commit message（feature commit，提交用英文原文，下附中文）
@@ -119,16 +119,20 @@ FlashInfer 目前没有任何能在 SM120 上运行的块缩放 FP8 attention；
   带 `sm120a_nvcc_flags` 的 JIT 模块、AOT 注册、trace 模板 + `fi_trace_out` 示例 +
   `tests/trace/example.py` 条目、API 文档、独立微基准
   （`benchmarks/bench_mxfp8_attention_sm120.py`）。
-- Python API 目前在 host 侧做每请求 128 行 padding 和 LPT work-list 构建
-  （已在 docstring 中注明）。
+- **plan/run 拆分**（`MXFP8AttentionSM120Wrapper`）：`plan()` 每步一次完成 batch 组成的
+  host 工作（128 行 padding 布局、持久化 LPT work-list），`run()` 每层一次、纯张量——
+  与 flashinfer 其他 prefill wrapper 的调用惯例一致，按层调用不重复 host 工作。
+  scales/`sm_scale` 在 run 时传入（per-layer 量化），`causal` 在 plan 时固定（影响调度
+  成本模型）。`mxfp8_attention_sm120_fwd` 保留为一次性 plan+run 的便捷入口。
 
 ### 测试（Testing）
 
 - `tests/attention/test_mxfp8_attention_sm120.py`（SM120/SM121 门控）：ragged GQA
   causal（bf16/fp16 输出）、ragged MHA 非 causal、单长请求（2048）、prefix 追加
-  （`kv_len > qo_len`）。参考实现精确回放 kernel 的数值行为——对**未归一化**的 P 以
-  固定 scale 256 重量化到 e4m3，再用**未量化**的 row sum 归一——因此门限对
-  mask/stride/GQA 索引类 bug 很紧，只容忍累加顺序噪声。**RTX 5060 Ti（SM120）5/5 通过。**
+  （`kv_len > qo_len`）、wrapper plan 复用（一次 plan 多次 run）、一次性函数式路径。
+  参考实现精确回放 kernel 的数值行为——对**未归一化**的 P 以固定 scale 256 重量化到
+  e4m3，再用**未量化**的 row sum 归一——因此门限对 mask/stride/GQA 索引类 bug 很紧，
+  只容忍累加顺序噪声。**RTX 5060 Ti（SM120）7/7 通过。**
 - trace 模板一致性测试通过（自动发现）。
 - ruff + clang-format（19.1.1）干净。
 - 上游化之前，同一 kernel 在 vLLM 0.21 中做过端到端验证（Qwen3-8B-AWQ、fp8 KV
@@ -162,7 +166,7 @@ padding/LPT 工作。
 - `BatchPrefillWithRaggedKVCacheWrapper` 调度集成（本 PR 仅独立算子）。
 - 去掉内部 V 转置：改用 HD-major 的 V smem atom（当前 Sk-major atom 要求 gmem
   Sk 连续；原因已写在 binding 注释中）。
-- 把 padding/LPT work-list 构建移出 Python 热路径（plan/run 拆分）。
+- 把 plan 期 host 工作（padding 布局 + LPT 列表）搬到 device 上，去掉 D2H sync。
 - 单长 prompt 场景的 split-KV 调度、RTX 5090 基准、vLLM 端到端接线。
 
 AI 辅助开发（kernel 在外部 worktree 完成编写与验证，含 ncu 指导的优化，然后上游化）。
