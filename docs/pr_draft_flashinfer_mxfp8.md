@@ -1,6 +1,7 @@
 # PR 草案：MXFP8 ragged prefill attention for SM120/121（待审核，勿直接提交）
 
-> 状态：**草案待审**。2026-07-25 误发的 draft PR flashinfer-ai/flashinfer#4147 已被作者关闭；
+> 状态：**已提交正式 PR：flashinfer-ai/flashinfer#4149**（2026-07-26，基于 main@290c091，分支同步最新上游后测试 7/7 通过）。
+> 误发的 draft PR #4147 已关闭。2026-07-25 误发的 draft PR flashinfer-ai/flashinfer#4147 已被作者关闭；
 > 审核通过本文档后再重新提交。分支 `ultism/flashinfer:mxfp8-prefill-sm120` 仍在（含全部改动，
 > 已合并上游 main@fa2672f，测试 5/5 通过）。
 
