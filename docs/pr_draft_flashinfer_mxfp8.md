@@ -111,17 +111,14 @@ Note: these are kernel-level numbers for the attention itself; the op-level Pyth
 ### Follow-ups (not in this PR)
 
 - `BatchPrefillWithRaggedKVCacheWrapper` dispatch integration (this PR is the standalone op only).
-- Drop the internal V transpose by moving to an HD-major V smem atom (the current Sk-major atom requires Sk-contiguous gmem; documented in the binding).
-- Move the plan-time host work (padding layout + LPT lists) on-device to remove the D2H sync.
-- Split-KV scheduling for single-long-prompt batches, RTX 5090 benchmarks, and vLLM e2e wiring.
 
 AI-assisted development (kernel authored and validated in an external worktree with ncu-guided optimization before upstreaming).
 
 ---
 
 1. ~~"2.8×" 数据要不要贴~~ → **已定：换 5090 实测表**（2.06–2.74×，tensor-pipe 47–55% vs 32–44%，fa2 钉在 HMMA.F32 上界 200–209 TFLOP/s；正文已更新，方法学链 `ultism/fa-blackwell` 的 `docs/5090_evidence.md`）。
-2. Follow-ups 清单是否删减（写多了可能被要求先完成再合入）？
-3. vLLM e2e 那段（"token-for-token"）是否保留——是我们自己环境的结果，上游无法直接复现。
+2. ~~Follow-ups 清单是否删减~~ → **已定：只留 wrapper 调度集成一条**（vLLM 等由他人跑）。
+3. ~~vLLM e2e 段~~ → **保留**（已完成的工作证据，非承诺）。
 4. ~~RFC 收不收进 PR~~ → **已定：只链 #3628，不收全文**（已执行）。
 5. 审核通过后：重开 #4147 还是新建 PR？
 6. commit message 里有一句 `(measured in docs/design_docs/mxfp8_prefill_sm120.md)`，

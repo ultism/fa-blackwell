@@ -164,10 +164,6 @@ padding/LPT 工作。
 ### 后续工作（Follow-ups，不在本 PR）
 
 - `BatchPrefillWithRaggedKVCacheWrapper` 调度集成（本 PR 仅独立算子）。
-- 去掉内部 V 转置：改用 HD-major 的 V smem atom（当前 Sk-major atom 要求 gmem
-  Sk 连续；原因已写在 binding 注释中）。
-- 把 plan 期 host 工作（padding 布局 + LPT 列表）搬到 device 上，去掉 D2H sync。
-- 单长 prompt 场景的 split-KV 调度、RTX 5090 基准、vLLM 端到端接线。
 
 AI 辅助开发（kernel 在外部 worktree 完成编写与验证，含 ncu 指导的优化，然后上游化）。
 
@@ -178,8 +174,8 @@ AI 辅助开发（kernel 在外部 worktree 完成编写与验证，含 ncu 指�
 1. ~~"2.8×" 数据要不要贴~~ → **已定：换 5090 实测表**（2.06–2.74×，tensor-pipe
    47–55% vs 32–44%，fa2 钉在 HMMA.F32 上界 200–209 TFLOP/s；正文已更新，方法学
    链 `ultism/fa-blackwell` 的 `docs/5090_evidence.md`）。
-2. Follow-ups 清单是否删减（写多了可能被要求先完成再合入）？
-3. vLLM e2e 那段（"逐 token 一致"）是否保留——是我们自己环境的结果，上游无法直接复现。
+2. ~~Follow-ups 清单是否删减~~ → **已定：只留 wrapper 调度集成一条**（vLLM 等由他人跑）。
+3. ~~vLLM e2e 段~~ → **保留**（已完成的工作证据，非承诺）。
 4. ~~RFC 收不收进 PR~~ → **已定：只链 #3628，不收全文**（已执行）。
 5. 审核通过后：重开 #4147 还是新建 PR？
 6. ~~commit message 引用被删文件路径~~ → **已定：改为引用 RFC issue #3628**（英文草案已同步）。
