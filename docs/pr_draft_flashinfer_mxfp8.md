@@ -43,7 +43,7 @@ which covers prefix-cache/chunked-prefill continuation natively.
 
 The block-scaled tensor instruction on consumer Blackwell sustains full
 throughput with FP32 accumulate while legacy warp-MMA FP32-acc paths are
-halved (measured in docs/design_docs/mxfp8_prefill_sm120.md), so the
+halved (measurements in RFC flashinfer-ai/flashinfer#3628), so the
 mainloop keeps the PV GEMM on the SM120 block-scaled MMA atom.
 
 Structure follows nvfp4_attention_sm120: framework-agnostic headers under
@@ -95,7 +95,18 @@ The block-scaled MXFP8 MMA is the only way to get full-rate tensor throughput *w
 
 ### Performance
 
-Correctness is the focus of this PR; detailed performance tuning/benchmarking is intentionally left for follow-up (see below). The kernel itself is a persistent TMA/warp-specialized design whose microbenchmarks during development showed ~2.8× over the FA2-path prefill it replaces on SM120; op-level numbers currently also include the host-side padding/LPT work.
+RTX 5090 (sm_120), same ragged batch on both sides, event timing (min of 5 alternating A/B rounds x 100 iters) cross-checked against single-launch `gpu__time_duration` from `ncu --set full` (agreement <3%). Baseline: flashinfer `BatchPrefillWithRaggedKVCacheWrapper(backend="fa2")`, bf16.
+
+| shape (identical batch both sides) | fa2 | ours | **speedup** | tensor-pipe active (fa2 / ours) |
+|---|---:|---:|---:|---:|
+| 16 mixed varlen requests, Hq8/Hkv2, causal | 0.388 ms | 0.141 ms | **2.74x** | 32.5% / 46.9% |
+| same batch, Hq32/Hkv8, causal | 1.165 ms | 0.566 ms | **2.06x** | 42.7% / 49.3% |
+| 8x2048 (Qwen3-8B-like), Hq32/Hkv8, causal | 1.317 ms | 0.614 ms | **2.14x** | 44.0% / 51.5% |
+| single 16384-token request, Hq16/Hkv4, causal | 5.434 ms | 2.234 ms | **2.43x** | 41.5% / 54.8% |
+
+Effective compute: fa2 saturates at ~200-209 TFLOP/s on the larger shapes — i.e. it already sits at 83-87% of the consumer-Blackwell `HMMA.F32` (bf16, FP32-accumulate) hardware ceiling. This kernel reaches 413-492 TFLOP/s with the same FP32-accumulate semantics on the block-scaled path, while its tensor pipe is only 47-55% busy — roughly 2x of headroom remains toward the block-scaled ceiling. Full methodology + raw reps: [`ultism/fa-blackwell` docs/5090_evidence.md](https://github.com/ultism/fa-blackwell/blob/master/docs/5090_evidence.md).
+
+Note: these are kernel-level numbers for the attention itself; the op-level Python path additionally does the host-side padding/LPT work described above.
 
 ### Follow-ups (not in this PR)
 
@@ -108,14 +119,7 @@ AI-assisted development (kernel authored and validated in an external worktree w
 
 ---
 
-1. PR 正文里 "2.8× over FA2-path prefill" 的微基准结论要不要保留（5060Ti 开发期数据，可能被要求贴证据）？
-   → **证据采集方案已备好（待 5090 执行）**：`prof/trace_5090_ab.sh`（本机已逐项冒烟通过）。
-     - 4 个形状 × 双侧同 batch：dev8x2 / dev32x8（开发期 16 请求 varlen batch）、qwen8b（8×2048，Hq32/Hkv8）、long1（单请求 16384，Hq16/Hkv4）。
-     - 事件计时：双侧各 20 warmup + 100 timed ×5 交替 A/B 轮取 min（抗 WSL/热节流）。
-     - ncu `--set full --clock-control none` 各抓一个稳态 launch：ours=`s3_kernel` skip 50，fa2=`BatchPrefill` skip 60。
-     - 对比指标：`gpu__time_duration.sum`（算子实际运行时间）、`sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed`（tensorcore 活跃度）、`sm__throughput`/`lts__throughput`（SOL）。
-     - 运行：`PY=<5090上的python> bash prof/trace_5090_ab.sh`（需 flashinfer 可导入 + nvcc/ncu；fa2 走 `prof/fa2_ab_prof.py`，ours 走 `tests/bench_ragged.cu` 的 S3_LENS/S3_QH/S3_KH env 覆盖）。
-     - 存量资产：5060Ti 留档 `prof/{fa2,real64,s9f}_8x2*.ncu-rep`、RFC issue #3628 的 QMMA issue-rate 表（`bench/mma_peak*.cu`）。
+1. ~~"2.8×" 数据要不要贴~~ → **已定：换 5090 实测表**（2.06–2.74×，tensor-pipe 47–55% vs 32–44%，fa2 钉在 HMMA.F32 上界 200–209 TFLOP/s；正文已更新，方法学链 `ultism/fa-blackwell` 的 `docs/5090_evidence.md`）。
 2. Follow-ups 清单是否删减（写多了可能被要求先完成再合入）？
 3. vLLM e2e 那段（"token-for-token"）是否保留——是我们自己环境的结果，上游无法直接复现。
 4. ~~RFC 收不收进 PR~~ → **已定：只链 #3628，不收全文**（已执行）。
