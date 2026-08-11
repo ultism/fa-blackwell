@@ -10,6 +10,7 @@
 #include <cute/tensor.hpp>
 #include <cute/atom/mma_atom.hpp>
 #include <cute/atom/mma_traits_sm120.hpp>
+#include <cute/atom/mma_traits_sm89.hpp>
 #include <cute/atom/copy_traits_sm90_tma.hpp>
 #include <cutlass/cutlass.h>
 #include <cutlass/arch/reg_reconfig.h>
@@ -123,8 +124,25 @@ constexpr float kLog2e = 1.4426950408889634f;
 constexpr int kQuantBarrier = 0;                  // named barrier id for P-smem handoff
 constexpr int kVFillBarrier = 1;                  // named barrier id for partial-block V kFillZero
 
+// SM90 port: below sm100 the SM120 block-scaled QMMA atom does not exist, so the compute
+// core swaps to the plain e4m3 mma.sync atom (sm89+ PTX, runs on sm90). Its ALayout/BLayout/
+// CLayout are BIT-IDENTICAL to the SM120 VS atom's (both are the standard m16n8k32 8-bit
+// thread-value layouts), so the LDSM copies, the S5 P-shuffle, masking, softmax and the
+// epilogue are all unchanged; only the SF (scale-factor) layer is excised. The plain-FP8
+// build supports ONLY SFSource::kUniformFp8 (per-tensor fp8 cache, scales folded into
+// sm_scale/o_scale on the host). Host + sm120 device passes keep the original types so the
+// sm120 build stays bit-exact.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+#define S3_PLAIN_FP8_MMA 1
+#else
+#define S3_PLAIN_FP8_MMA 0
+#endif
+#if S3_PLAIN_FP8_MMA
+using AtomMXF8 = cute::SM89_16x8x32_F32E4M3E4M3F32_TN;
+#else
 using AtomMXF8 = cute::SM120::BLOCKSCALED::SM120_16x8x32_TN_VS<
     Element, Element, float, ElementSF, SFVecSize>;
+#endif
 using TileShape_MNK = Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
 using TiledMmaQK = decltype(make_tiled_mma(
     AtomMXF8{}, Layout<Shape<_8, _1, _1>>{}, Tile<_128, _32, Int<kHeadDim>>{}));
@@ -295,6 +313,10 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
   // kMxFp8 -> stream real per-block SF via TMA; kUniformFp8 -> synthesize a constant byte 127 in
   // registers and SKIP every SF TMA (paired with the data-only transaction_bytes below).
   constexpr bool kLoadSF = (Src == SFSource::kMxFp8);
+#if S3_PLAIN_FP8_MMA
+  static_assert(Src == SFSource::kUniformFp8,
+                "plain-FP8 (sm90) build supports only the per-tensor fp8 kUniformFp8 path");
+#endif
 
   int const wg = cutlass::canonical_warp_group_idx();        // 0=producer
   int const warp_in_wg = cutlass::canonical_warp_idx_sync() % 4;
@@ -430,22 +452,25 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
     // QK operands
     Tensor tSrQ = thr_qk.partition_fragment_A(sQ);
     Tensor tSrK = thr_qk.partition_fragment_B(sK(_, _, _0{}));
-    Tensor tSrSFQ = mxfp8::partition_fragment_SFA(sSFQ, thr_qk);
-    Tensor tSrSFK = mxfp8::partition_fragment_SFB(sSFK(_, _, _0{}), thr_qk);
     auto scQ = make_tiled_copy_A(SmemCopyAtomData{}, mma_qk); auto tscQ = scQ.get_thread_slice(tid);
     auto scK = make_tiled_copy_B(SmemCopyAtomData{}, mma_qk); auto tscK = scK.get_thread_slice(tid);
+#if !S3_PLAIN_FP8_MMA
+    Tensor tSrSFQ = mxfp8::partition_fragment_SFA(sSFQ, thr_qk);
+    Tensor tSrSFK = mxfp8::partition_fragment_SFB(sSFK(_, _, _0{}), thr_qk);
     auto ts_qk = tile_shape(mma_qk);
     auto scSFQ = make_tiled_copy_impl(SmemCopyAtomSF{}, mxfp8::get_layoutSFA_TV(mma_qk), make_shape(size<0>(ts_qk), size<2>(ts_qk)));
     auto scSFK = make_tiled_copy_impl(SmemCopyAtomSF{}, mxfp8::get_layoutSFB_TV(mma_qk), make_shape(size<1>(ts_qk), size<2>(ts_qk)));
     auto tscSFQ = scSFQ.get_thread_slice(tid); auto tscSFK = scSFK.get_thread_slice(tid);
+#endif
 
     // PV operands
     Tensor tOrP  = thr_pv.partition_fragment_A(sP);
     Tensor tOrV  = thr_pv.partition_fragment_B(sV);
-    Tensor tOrSFP = mxfp8::partition_fragment_SFA(sSFQ, thr_pv);     // canonical SFA layout (cosize-1)
-    Tensor tOrSFV = mxfp8::partition_fragment_SFB(sSFV, thr_pv);
     auto scP = make_tiled_copy_A(SmemCopyAtomData{}, mma_pv); auto tscP = scP.get_thread_slice(tid);
     auto scV = make_tiled_copy_B(SmemCopyAtomData{}, mma_pv); auto tscV = scV.get_thread_slice(tid);
+#if !S3_PLAIN_FP8_MMA
+    Tensor tOrSFP = mxfp8::partition_fragment_SFA(sSFQ, thr_pv);     // canonical SFA layout (cosize-1)
+    Tensor tOrSFV = mxfp8::partition_fragment_SFB(sSFV, thr_pv);
     auto ts_pv = tile_shape(mma_pv);
     auto scSFV = make_tiled_copy_impl(SmemCopyAtomSF{}, mxfp8::get_layoutSFB_TV(mma_pv), make_shape(size<1>(ts_pv), size<2>(ts_pv)));
     auto tscSFV = scSFV.get_thread_slice(tid);
@@ -463,6 +488,7 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
           get<2>(f.layout())))(_, make_coord(_, make_coord(_, h)), _);
       return group_modes<1, 3>(t);
     };
+#endif
     auto max_op = [](float a, float b) { return fmaxf(a, b); };
     auto add_op = [](float a, float b) { return a + b; };
 
@@ -510,11 +536,13 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
 
       { auto t = pipeline_q.consumer_try_wait(rq); pipeline_q.consumer_wait(rq, t);
         copy(scQ, tscQ.partition_S(as_position_independent_swizzle_tensor(sQ)), tscQ.retile_D(tSrQ));
+#if !S3_PLAIN_FP8_MMA
         if constexpr (kLoadSF)
           copy(scSFQ, tscSFQ.partition_S(as_position_independent_swizzle_tensor(sSFQ)), tscSFQ.retile_D(tSrSFQ));
         else
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < size(tSrSFQ); ++i) tSrSFQ(i) = ElementSF::bitcast(kUniformSFByte);
+#endif
         pipeline_q.consumer_release(rq); ++rq; }
 
       // S9: drive the n_block loop in even/odd PAIRS so the SF half h = nb&1 is a
@@ -536,17 +564,27 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         { auto t = pipeline_k.consumer_try_wait(rk); pipeline_k.consumer_wait(rk, t);
           int stage = rk.index();
           copy(scK, tscK.partition_S(as_position_independent_swizzle_tensor(sK(_, _, stage))), tscK.retile_D(tSrK));
+#if !S3_PLAIN_FP8_MMA
           if constexpr (kLoadSF)
             copy(scSFK, tscSFK.partition_S(as_position_independent_swizzle_tensor(sSFK(_, _, stage))), tscSFK.retile_D(tSrSFK));
           else
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < size(tSrSFK); ++i) tSrSFK(i) = ElementSF::bitcast(kUniformSFByte); }
+#else
+          }
+#endif
         clear(accS);
-        auto tSrSFK_h = subSFK(tSrSFK, hc);   // 64-key SF half for this data block (static h)
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < size<2>(tSrQ); ++k)
+#if S3_PLAIN_FP8_MMA
+          cute::gemm(mma_qk, tSrQ(_, _, k), tSrK(_, _, k), accS);
+#else
+        {
+          auto tSrSFK_h = subSFK(tSrSFK, hc);   // 64-key SF half for this data block (static h)
           cute::gemm(mma_qk, make_zip_tensor(tSrQ(_, _, k), tSrSFQ(_, _, k)),
                      make_zip_tensor(tSrK(_, _, k), tSrSFK_h(_, _, k)), accS);
+        }
+#endif
         pipeline_k.consumer_release(rk); ++rk;
 
         // request-local masking. Causal diagonal is shifted by offset_q = kv_len - qo_len
@@ -640,7 +678,9 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             }
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < 8; ++j) rP_rc(mi, sfi * 8 + j) = quant_e4m3(accS_rc(mi, sfi * 8 + j), se);
+#if !S3_PLAIN_FP8_MMA
             if (!kPConstSF && (lane % 4) == 0) ss.sSFP[q_local * NKB + sfi] = ElementSF::bitcast(uint8_t(se + 127));
+#endif
             if (params.out_dbg) {     // dequantized requant-P, indexed by logical (q, key)
               int q = q_tile_global * kBlockM + warp * 16 + (lane / 4) + mi * 8;
               CUTLASS_PRAGMA_UNROLL
@@ -656,6 +696,7 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         copy(rP, thr_qk.partition_C(as_position_independent_swizzle_tensor(sP)));
         cutlass::arch::NamedBarrier(NumMmaThreads, kQuantBarrier).sync();   // P/SF visible
         copy(scP, tscP.partition_S(as_position_independent_swizzle_tensor(sP)), tscP.retile_D(tOrP));
+#if !S3_PLAIN_FP8_MMA
         if constexpr (kPConstSF) {   // constant P scale -> no smem SF, no gather
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < size(tOrSFP); ++i) tOrSFP(i) = ElementSF::bitcast(uint8_t(kPScaleExp + 127));
@@ -666,6 +707,7 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             tOrSFP(i) = ss.sSFP[int(get<0>(c)) * NKB + int(get<1>(c)) / SFVecSize];
           }
         }
+#endif
 #else
         // S5 path: quantize accS to e4m3 in registers, then intra-quad __shfl directly into
         // the PV-A operand tOrP -- no sP, no NamedBarrier. The QK-C key partition (2 adjacent
@@ -719,8 +761,10 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
             }
           }
         }
+#if !S3_PLAIN_FP8_MMA
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tOrSFP); ++i) tOrSFP(i) = ElementSF::bitcast(uint8_t(kPScaleExp + 127));
+#endif
 #endif
         { auto t = pipeline_v.consumer_try_wait(rv); pipeline_v.consumer_wait(rv, t);
 #if S3_V_KFILLZERO
@@ -736,15 +780,17 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
           }
 #endif
           copy(scV, tscV.partition_S(as_position_independent_swizzle_tensor(sV)), tscV.retile_D(tOrV));
+#if !S3_PLAIN_FP8_MMA
           if constexpr (kLoadSF)
             copy(scSFV, tscSFV.partition_S(as_position_independent_swizzle_tensor(sSFV)), tscSFV.retile_D(tOrSFV));
           else
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < size(tOrSFV); ++i) tOrSFV(i) = ElementSF::bitcast(kUniformSFByte);
+#endif
           // the ldmatrix drained sV/sSFV into registers -> release EARLY so the producer's
           // V(nb+1) TMA overlaps the rescale/PV work below (the gemm reads registers, not smem).
           pipeline_v.consumer_release(rv); ++rv; }
-#if S3_V_KFILLZERO
+#if S3_V_KFILLZERO && !S3_PLAIN_FP8_MMA
         // Fully-masked 32-key tiles (all keys >= kv_len) may carry a garbage NaN SF (ue8m0 0xFF);
         // replace with a finite byte. Their DATA was zeroed above. The straddling tile keeps its
         // real SF (shared with valid keys), whose masked keys are already 0 in the data.
@@ -781,8 +827,12 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
         }
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < size<2>(tOrP); ++k)
+#if S3_PLAIN_FP8_MMA
+          cute::gemm(mma_pv, tOrP(_, _, k), tOrV(_, _, k), accO);
+#else
           cute::gemm(mma_pv, make_zip_tensor(tOrP(_, _, k), tOrSFP(_, _, k)),
                      make_zip_tensor(tOrV(_, _, k), tOrSFV(_, _, h * NKB + k)), accO);   // V-SF half
+#endif
       };
       for (int nb = 0; nb < n_block_max; nb += 2) {
         step(nb, cute::Int<0>{});                              // even block: SF half 0
@@ -795,7 +845,13 @@ s3_kernel(CUTE_GRID_CONSTANT Params const params,
       CUTLASS_PRAGMA_UNROLL
       for (int mi = 0; mi < size<0>(accO_rc); ++mi) {
         // o_scale folds the per-tensor v_scale (kUniformFp8); 1.0 for kMxFp8 -> bit-exact 1/row_sum.
+        // PLAIN-FP8 (sm90): the PV MMA consumes RAW e4m3 P bytes (p*256) with no SF to fold the
+        // 2^-8 back, so accO is 256x the true sum -- divide it out here (linear, once).
+#if S3_PLAIN_FP8_MMA
+        float inv = (row_sum[mi] == 0.f) ? 0.f : params.o_scale / (row_sum[mi] * 256.f);
+#else
         float inv = (row_sum[mi] == 0.f) ? 0.f : params.o_scale / row_sum[mi];
+#endif
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(accO_rc); ++ni) accO_rc(mi, ni) *= inv;
       }

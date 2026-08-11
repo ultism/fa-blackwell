@@ -6,7 +6,9 @@ Run:  /root/vllm-omni/.venv/bin/python tests/test_ragged_ext.py
 """
 import os, pathlib, sys, torch
 
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0a")
+# SM90 (H20): S3_GENCODE="arch=compute_90a,code=sm_90a" python tests/test_ragged_ext.py
+GENCODE = os.environ.get("S3_GENCODE", "arch=compute_120a,code=sm_120a")
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0a" if "90a" in GENCODE else "12.0a")
 from torch.utils.cpp_extension import load
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -15,6 +17,13 @@ _ext = None
 def ext():
     global _ext
     if _ext is None:
+        so = os.environ.get("S3_EXT_SO")   # prebuilt .so (e.g. cross-compiled sm90a artifact)
+        if so:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("mxfp8_ragged_ext", so)
+            _ext = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(_ext)
+            return _ext
         _ext = load(
             name="mxfp8_ragged_ext",
             sources=[str(ROOT / "tests" / "csrc" / "mxfp8_ragged_ext.cpp"),
@@ -22,7 +31,7 @@ def ext():
             extra_include_paths=[str(ROOT / "tmp" / "cutlass" / "include"),
                                  str(ROOT / "include"), str(ROOT / "tests")],
             extra_cflags=["-std=c++17", "-O2", "-fpermissive"],
-            extra_cuda_cflags=["-std=c++17", "-O2", "-gencode", "arch=compute_120a,code=sm_120a",
+            extra_cuda_cflags=["-std=c++17", "-O2", "-gencode", GENCODE,
                                "--expt-relaxed-constexpr", "--expt-extended-lambda"],
             verbose=False,
         )
