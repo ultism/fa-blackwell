@@ -12,12 +12,18 @@ CUDA 13.0). Kernel numerics: O max|abs| = **2.4e-3** vs an fp64 oracle
 ## Requirements
 
 - sm90 GPU (H100/H20), driver with CUDA ≥ 13.0
-- python 3.12, torch ≥ 2.11.0+cu130 (the vllm 0.26.0 image matches exactly)
+- python 3.12, **torch == 2.11.0+cu130 exactly** — the bundled extension is a
+  torch C++ extension (no cross-version ABI); e.g. torch 2.12/2.13 fails at
+  import with `undefined symbol: _ZN3c104impl3cow23materialize_cow_storage...`.
+  The `vllm/vllm-openai:v0.26.0` image matches out of the box.
 - linux x86_64
 
 ## Install & run
 
 ```bash
+# torch must be pinned BEFORE installing the wheel (uv run auto-syncs to the
+# latest torch unless the pin is in pyproject.toml / requirements):
+pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 pip install fp8flash-0.1.0-py3-none-linux_x86_64.whl
 python example.py     # smoke test incl. fp32-SDPA cross-check
 ```
