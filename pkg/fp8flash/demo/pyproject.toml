@@ -1,0 +1,27 @@
+[project]
+name = "fp8flash-demo"
+version = "0.1.0"
+description = "fp8flash smoke test: sm90 (H20) fp8 e4m3 flash-attn, FA2-compatible call"
+requires-python = ">=3.12,<3.13"   # bundled kernel .so is cp312 ABI
+dependencies = [
+    "fp8flash",
+    "torch==2.11.0",                # HARD PIN: the bundled extension is built against
+                                    # torch 2.11 C++ ABI; 2.12+/2.13 fails at import with
+                                    # undefined symbol c10::impl::cow::materialize_cow_storage
+]
+
+[tool.uv]
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://mirrors.aliyun.com/pytorch-wheels/cu130"
+explicit = true
+format = "flat"
+# fallback if the mirror lags:
+# [[tool.uv.index]]
+# name = "pytorch-cu130"
+# url = "https://download.pytorch.org/whl/cu130"
+# explicit = true
+
+[tool.uv.sources]
+fp8flash = { path = "fp8flash-0.1.0-py3-none-linux_x86_64.whl" }
+torch = { index = "pytorch-cu130" }
